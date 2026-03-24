@@ -201,148 +201,148 @@ public:
         : TFileEditor(bounds, hScrollBar, vScrollBar, indicator, filename)
     {}
 
-    // Map palette indices to colours.
-    // TEditor uses index 1 (normal) and 2 (selected) internally.
-    // We add 3=keyword, 4=comment, 5=string, 6=number.
+    // Override mapColor so the base-class draw() uses our background colour
+    // for normal (index 1) and selected (index 2) text.
     TColorAttr mapColor(uchar index) noexcept override {
         switch (index) {
             case 1: return TColorAttr(TColorRGB(0xC0C0C0), TColorRGB(0x000080)); // normal
             case 2: return TColorAttr(TColorRGB(0x000000), TColorRGB(0x00AAAA)); // selected
-            case 3: return TColorAttr(TColorRGB(0xFFFF55), TColorRGB(0x000080)); // keyword
-            case 4: return TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080)); // comment
-            case 5: return TColorAttr(TColorRGB(0x55FF55), TColorRGB(0x000080)); // string
-            case 6: return TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080)); // number
             default: return TFileEditor::mapColor(index);
         }
     }
 
-    // Actual signature from editors.h:
-    // void formatLine(TDrawBuffer& buf, uint linePtr, int lineLen, int lineWidth, TAttrPair colors)
-    // linePtr  = byte offset into the editor buffer where this line starts
-    // lineLen  = number of characters in the line
-    // lineWidth = number of columns to fill (may be > lineLen due to scroll)
-    // colors   = TAttrPair: low byte = normal attr index, high byte = selected attr index
-    void formatLine(TDrawBuffer& buf, uint linePtr, int lineLen,
-                    int lineWidth, TAttrPair colors) {
-        // Extract the normal and selected colour attributes from the pair.
-        // TAttrPair packs two TColorAttr values; we access them via mapColor.
-        // colors low = palette index for normal text (usually 1)
-        // colors high = palette index for selected text (usually 2)
-        // If any part of the line is selected, the base class handles colouring
-        // for the selected region. We only need to handle the non-selected case.
-        //
-        // Strategy: build our own colouring, then let the base class overlay
-        // the selection on top by calling it with modified colors.
-        // Actually, the cleanest approach: call base class first (which fills
-        // buf with normal/selected colours), then re-colour non-selected chars
-        // with syntax colour. But that doesn't work well.
-        //
-        // Better: replicate what the base class does but with our token colours.
-        // The base class just calls buf.moveChar for each character.
-        // We do the same but choose the colour based on token type.
+    // draw() is virtual on TView.  We call the base-class draw() first so
+    // that the editor content, cursor, and selection are all rendered
+    // correctly.  Then we do a second pass over every visible column of
+    // every visible line: we re-read the raw gap buffer, re-tokenise, and
+    // overwrite the colour attribute of non-selected characters with the
+    // appropriate syntax colour using writeChar().
+    //
+    // writeChar(x, y, ch, colorIndex, count) uses palette index → mapColor(),
+    // but we want literal TColorAttr values.  Instead we build a one-cell
+    // TDrawBuffer and call writeBuf(), which accepts TColorAttr directly.
+    void draw() override {
+        // 1. Let the base class do its full draw (text, cursor, selection).
+        TFileEditor::draw();
 
-        // Get the two colour attributes
-        TColorAttr clrNormal   = mapColor(1);
-        TColorAttr clrSelected = mapColor(2);
+        // 2. Determine visible line range.
+        //    delta.y = first visible logical line index,  size.y = visible rows.
+        int firstLine = delta.y;          // topmost visible line
+        int visRows   = size.y;
+        int visCols   = size.x;
+        int firstCol  = delta.x;          // horizontal scroll offset
 
-        // We need to know the selection range to correctly colour selected chars.
-        // TEditor exposes: selStart, selEnd, curPtr (all byte offsets).
-        // The selection is [min(selStart,selEnd) .. max(selStart,selEnd)).
+        // Selection range (byte offsets, normalised lo<=hi)
         uint selLo = (selStart <= selEnd) ? selStart : selEnd;
         uint selHi = (selStart <= selEnd) ? selEnd   : selStart;
 
-        // Walk the source text, tokenise, fill buf one character at a time.
-        int col = 0;
-
-        // Helper: write one character to buf at column col with a colour attr.
-        // If the character is within the selection, always use clrSelected.
-        auto putChar = [&](char ch, uint bufOffset, TColorAttr ca) {
-            bool selected = (bufOffset >= selLo && bufOffset < selHi);
-            buf.moveChar(col, ch, selected ? clrSelected : ca, 1);
-            col++;
+        // Helper: read logical char index i from the gap buffer
+        auto gapChar = [&](uint i) -> char {
+            return buffer[ i < curPtr ? i : i + gapLen ];
         };
 
-        // Read characters from the gap buffer.
-        // Physical index for logical index i: i < curPtr ? i : i + gapLen
-        auto physChar = [&](int i) -> char {
-            uint phys = ((uint)i < curPtr) ? (uint)i : (uint)i + gapLen;
-            return buffer[phys];
-        };
-
-        int i = (int)linePtr;
-        int end = i + lineLen;
-
-        while (i < end && col < lineWidth) {
-            char c = physChar(i);
-
-            // { ... } block comment
-            if (c == '{') {
-                int start = i++;
-                while (i < end && physChar(i) != '}') i++;
-                if (i < end) i++;
-                for (int j = start; j < i && col < lineWidth; j++)
-                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(4));
-                continue;
-            }
-            // (* ... *) comment
-            if (c == '(' && i+1 < end && physChar(i+1) == '*') {
-                int start = i; i += 2;
-                while (i < end) {
-                    if (physChar(i) == '*' && i+1 < end && physChar(i+1) == ')') { i += 2; break; }
-                    i++;
-                }
-                for (int j = start; j < i && col < lineWidth; j++)
-                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(4));
-                continue;
-            }
-            // // line comment
-            if (c == '/' && i+1 < end && physChar(i+1) == '/') {
-                for (int j = i; j < end && col < lineWidth; j++)
-                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(4));
-                i = end;
-                continue;
-            }
-            // String/char literal '...'
-            if (c == '\'') {
-                int start = i++;
-                while (i < end) {
-                    if (physChar(i++) == '\'') break;
-                }
-                for (int j = start; j < i && col < lineWidth; j++)
-                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(5));
-                continue;
-            }
-            // Hex or decimal number
-            if (isdigit((unsigned char)c) ||
-                (c == '$' && i+1 < end && isxdigit((unsigned char)physChar(i+1)))) {
-                int start = i;
-                while (i < end && (isalnum((unsigned char)physChar(i)) || physChar(i) == '.')) i++;
-                for (int j = start; j < i && col < lineWidth; j++)
-                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(6));
-                continue;
-            }
-            // Identifier or keyword
-            if (isalpha((unsigned char)c) || c == '_') {
-                int start = i;
-                while (i < end && (isalnum((unsigned char)physChar(i)) || physChar(i) == '_')) i++;
-                // Copy word into a small buffer for keyword check
-                char word[64]; int wlen = std::min(i - start, 63);
-                for (int j = 0; j < wlen; j++) word[j] = physChar(start + j);
-                word[wlen] = '\0';
-                uchar tok = isPascalKeyword(word, wlen) ? 3 : 1;
-                for (int j = start; j < i && col < lineWidth; j++)
-                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(tok));
-                continue;
-            }
-            // Everything else
-            putChar(c, linePtr + (i - (int)linePtr), mapColor(1));
-            i++;
+        // Walk to the first visible line
+        uint lineStart = 0;             // byte offset of start of current line
+        int  lineNo    = 0;
+        // Scan from beginning to find byte offset of firstLine
+        // (We walk the whole buffer once; acceptable since files are small)
+        while (lineNo < firstLine && lineStart < bufLen) {
+            if (gapChar(lineStart) == '\n') lineNo++;
+            lineStart++;
         }
-        // Pad remaining columns with spaces in normal colour
-        while (col < lineWidth)
-            buf.moveChar(col++, ' ', clrNormal, 1);
+
+        // Now render each visible row
+        for (int row = 0; row < visRows && lineStart <= bufLen; row++) {
+            // Find end of this logical line
+            uint lineEnd = lineStart;
+            while (lineEnd < bufLen && gapChar(lineEnd) != '\n') lineEnd++;
+
+            // Tokenise and write re-coloured characters for this line
+            // We only touch columns [firstCol .. firstCol+visCols)
+            uint i = lineStart;
+            int  screenCol = 0;  // column index relative to visible area
+
+            // Helper: colour one char at buffer offset i, screen col sc
+            auto recolour = [&](uint offset, char ch, TColorAttr ca) {
+                // Skip selected characters — leave them as drawn by base class
+                if (offset >= selLo && offset < selHi) return;
+                int sc = (int)(offset - lineStart) - firstCol;
+                if (sc < 0 || sc >= visCols) return;
+                TDrawBuffer b;
+                b.moveChar(0, ch, ca, 1);
+                writeBuf(sc, row, 1, 1, b);
+            };
+
+            while (i < lineEnd) {
+                char c = gapChar(i);
+
+                // { ... } block comment
+                if (c == '{') {
+                    uint start = i++;
+                    while (i < lineEnd && gapChar(i) != '}') i++;
+                    if (i < lineEnd) i++;
+                    TColorAttr ca = TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080));
+                    for (uint j = start; j < i; j++) recolour(j, gapChar(j), ca);
+                    continue;
+                }
+                // (* ... *) comment
+                if (c == '(' && i+1 < lineEnd && gapChar(i+1) == '*') {
+                    uint start = i; i += 2;
+                    while (i < lineEnd) {
+                        if (gapChar(i) == '*' && i+1 < lineEnd && gapChar(i+1) == ')') { i += 2; break; }
+                        i++;
+                    }
+                    TColorAttr ca = TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080));
+                    for (uint j = start; j < i; j++) recolour(j, gapChar(j), ca);
+                    continue;
+                }
+                // // line comment
+                if (c == '/' && i+1 < lineEnd && gapChar(i+1) == '/') {
+                    TColorAttr ca = TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080));
+                    for (uint j = i; j < lineEnd; j++) recolour(j, gapChar(j), ca);
+                    i = lineEnd;
+                    continue;
+                }
+                // String/char literal '...'
+                if (c == '\'') {
+                    uint start = i++;
+                    while (i < lineEnd) { if (gapChar(i++) == '\'') break; }
+                    TColorAttr ca = TColorAttr(TColorRGB(0x55FF55), TColorRGB(0x000080));
+                    for (uint j = start; j < i; j++) recolour(j, gapChar(j), ca);
+                    continue;
+                }
+                // Hex or decimal number
+                if (isdigit((unsigned char)c) ||
+                    (c == '$' && i+1 < lineEnd && isxdigit((unsigned char)gapChar(i+1)))) {
+                    uint start = i;
+                    while (i < lineEnd && (isalnum((unsigned char)gapChar(i)) || gapChar(i) == '.')) i++;
+                    TColorAttr ca = TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080));
+                    for (uint j = start; j < i; j++) recolour(j, gapChar(j), ca);
+                    continue;
+                }
+                // Identifier or keyword
+                if (isalpha((unsigned char)c) || c == '_') {
+                    uint start = i;
+                    while (i < lineEnd && (isalnum((unsigned char)gapChar(i)) || gapChar(i) == '_')) i++;
+                    char word[64]; int wlen = std::min((int)(i - start), 63);
+                    for (int k = 0; k < wlen; k++) word[k] = gapChar(start + k);
+                    word[wlen] = '\0';
+                    if (isPascalKeyword(word, wlen)) {
+                        TColorAttr ca = TColorAttr(TColorRGB(0xFFFF55), TColorRGB(0x000080));
+                        for (uint j = start; j < i; j++) recolour(j, gapChar(j), ca);
+                    }
+                    // non-keywords: leave base-class colour (already correct)
+                    continue;
+                }
+                i++;
+            }
+
+            // Advance to next line
+            lineStart = lineEnd + 1;  // +1 to skip the '\n'
+        }
     }
 };
+
 
 // ── Editor Window ─────────────────────────────────────────────────────────
 class TEditorWindow : public TWindow {

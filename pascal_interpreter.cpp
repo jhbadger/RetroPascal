@@ -117,6 +117,9 @@ class Lexer {
                 while (pos < src.size() && !(peek() == '*' && peek(1) == ')')) advance();
                 if (pos < src.size()) { advance(); advance(); }
             }
+						else if (c == '#' && peek(1) == '!') {
+                while (pos < src.size() && peek() != '\n') advance();
+            }
             else if (c == '/' && peek(1) == '/') {
                 while (pos < src.size() && peek() != '\n') advance();
             }

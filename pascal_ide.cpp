@@ -38,10 +38,13 @@
 #define Uses_TDrawBuffer
 #define Uses_TScroller
 #define Uses_TScreen
+#define Uses_TColorAttr
 #include <tvision/tv.h>
 
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -70,20 +73,30 @@ static void runPascalInteractive(const char* filepath) {
     printf("\n--- Running %s ---\n\n", filepath);
     fflush(stdout);
 
-    const char* candidates[] = { "./pascal", "pascal", nullptr };
-    std::string interp;
-    for (int i = 0; candidates[i]; i++)
-        if (access(candidates[i], X_OK) == 0) { interp = candidates[i]; break; }
+    // execlp searches PATH automatically, so just use the binary name.
+    // We also check for a copy next to the IDE binary first (common install layout).
+    // We find the IDE's own directory via /proc/self/exe, then try "pascal" there,
+    // then fall back to PATH.
+    std::string interp = "pascal"; // default: search PATH
+    {
+        char self[4096] = {};
+        ssize_t len = readlink("/proc/self/exe", self, sizeof(self)-1);
+        if (len > 0) {
+            std::string selfPath(self, len);
+            std::string dir = selfPath.substr(0, selfPath.rfind('/') + 1);
+            std::string candidate = dir + "pascal";
+            if (access(candidate.c_str(), X_OK) == 0)
+                interp = candidate;
+        }
+    }
 
-    if (interp.empty()) {
-        printf("Error: 'pascal' interpreter not found.\n"
-               "Place it in the same directory as pascal_ide.\n");
-    } else {
+    {
         pid_t pid = fork();
         if (pid == 0) {
-            // Child: inherit stdin/stdout/stderr from the terminal
+            // Child: inherit stdin/stdout/stderr from the terminal.
+            // execlp searches PATH if interp has no '/' in it.
             execlp(interp.c_str(), interp.c_str(), filepath, nullptr);
-            perror("execlp");
+            perror("execlp: pascal not found");
             _exit(127);
         } else if (pid > 0) {
             int status;
@@ -134,11 +147,208 @@ public:
     }
 };
 
+
+// ── Pascal syntax-highlighting editor ────────────────────────────────────
+//
+// Colour palette indices (passed to mapColor):
+//   1 = normal text     (white on blue)
+//   2 = selected text   (black on cyan)  -- tvision built-in selected
+//   3 = keyword         (bold yellow on blue)
+//   4 = comment         (cyan on blue)
+//   5 = string/char     (bright green on blue)
+//   6 = number          (bright cyan on blue)
+//   7 = preprocessor/directive (magenta on blue)
+//
+// formatLine is called once per visible line; we walk the raw buffer,
+// tokenise on the fly, and call TScreenCell::moveChar with the right
+// colour index for each character.
+
+static const char* PASCAL_KEYWORDS[] = {
+    "program","unit","uses","interface","implementation","initialization","finalization",
+    "var","const","type","label","procedure","function","begin","end","forward",
+    "if","then","else","case","of","for","to","downto","do","while","repeat","until",
+    "with","goto","exit","halt","break","continue",
+    "and","or","not","xor","div","mod","shl","shr","in","is","as",
+    "array","record","set","file","object","class","string","packed",
+    "nil","true","false",
+    "integer","real","boolean","char","byte","word","longint","shortint",
+    "cardinal","int64","single","double","extended","comp","currency",
+    "pointer","pchar","ansistring","widestring","shortstring",
+    "write","writeln","read","readln","assigned","new","dispose","sizeof","typeof",
+    nullptr
+};
+
+static bool isPascalKeyword(const char* p, int len) {
+    char buf[32];
+    if (len <= 0 || len >= 32) return false;
+    for (int i = 0; i < len; i++) buf[i] = tolower((unsigned char)p[i]);
+    buf[len] = '\0';
+    for (int i = 0; PASCAL_KEYWORDS[i]; i++)
+        if (strcmp(buf, PASCAL_KEYWORDS[i]) == 0) return true;
+    return false;
+}
+
+// Token types
+enum PasToken { ptNormal=1, ptKeyword=3, ptComment=4, ptString=5, ptNumber=6 };
+
+class TPascalEditor : public TFileEditor {
+public:
+    TPascalEditor(const TRect& bounds,
+                  TScrollBar* hScrollBar,
+                  TScrollBar* vScrollBar,
+                  TIndicator* indicator,
+                  TStringView filename)
+        : TFileEditor(bounds, hScrollBar, vScrollBar, indicator, filename)
+    {}
+
+    // Map palette indices to colours.
+    // TEditor uses index 1 (normal) and 2 (selected) internally.
+    // We add 3=keyword, 4=comment, 5=string, 6=number.
+    TColorAttr mapColor(uchar index) noexcept override {
+        switch (index) {
+            case 1: return TColorAttr(TColorRGB(0xC0C0C0), TColorRGB(0x000080)); // normal
+            case 2: return TColorAttr(TColorRGB(0x000000), TColorRGB(0x00AAAA)); // selected
+            case 3: return TColorAttr(TColorRGB(0xFFFF55), TColorRGB(0x000080)); // keyword
+            case 4: return TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080)); // comment
+            case 5: return TColorAttr(TColorRGB(0x55FF55), TColorRGB(0x000080)); // string
+            case 6: return TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0x000080)); // number
+            default: return TFileEditor::mapColor(index);
+        }
+    }
+
+    // Actual signature from editors.h:
+    // void formatLine(TDrawBuffer& buf, uint linePtr, int lineLen, int lineWidth, TAttrPair colors)
+    // linePtr  = byte offset into the editor buffer where this line starts
+    // lineLen  = number of characters in the line
+    // lineWidth = number of columns to fill (may be > lineLen due to scroll)
+    // colors   = TAttrPair: low byte = normal attr index, high byte = selected attr index
+    void formatLine(TDrawBuffer& buf, uint linePtr, int lineLen,
+                    int lineWidth, TAttrPair colors) {
+        // Extract the normal and selected colour attributes from the pair.
+        // TAttrPair packs two TColorAttr values; we access them via mapColor.
+        // colors low = palette index for normal text (usually 1)
+        // colors high = palette index for selected text (usually 2)
+        // If any part of the line is selected, the base class handles colouring
+        // for the selected region. We only need to handle the non-selected case.
+        //
+        // Strategy: build our own colouring, then let the base class overlay
+        // the selection on top by calling it with modified colors.
+        // Actually, the cleanest approach: call base class first (which fills
+        // buf with normal/selected colours), then re-colour non-selected chars
+        // with syntax colour. But that doesn't work well.
+        //
+        // Better: replicate what the base class does but with our token colours.
+        // The base class just calls buf.moveChar for each character.
+        // We do the same but choose the colour based on token type.
+
+        // Get the two colour attributes
+        TColorAttr clrNormal   = mapColor(1);
+        TColorAttr clrSelected = mapColor(2);
+
+        // We need to know the selection range to correctly colour selected chars.
+        // TEditor exposes: selStart, selEnd, curPtr (all byte offsets).
+        // The selection is [min(selStart,selEnd) .. max(selStart,selEnd)).
+        uint selLo = (selStart <= selEnd) ? selStart : selEnd;
+        uint selHi = (selStart <= selEnd) ? selEnd   : selStart;
+
+        // Walk the source text, tokenise, fill buf one character at a time.
+        int col = 0;
+
+        // Helper: write one character to buf at column col with a colour attr.
+        // If the character is within the selection, always use clrSelected.
+        auto putChar = [&](char ch, uint bufOffset, TColorAttr ca) {
+            bool selected = (bufOffset >= selLo && bufOffset < selHi);
+            buf.moveChar(col, ch, selected ? clrSelected : ca, 1);
+            col++;
+        };
+
+        // Read characters from the gap buffer.
+        // Physical index for logical index i: i < curPtr ? i : i + gapLen
+        auto physChar = [&](int i) -> char {
+            uint phys = ((uint)i < curPtr) ? (uint)i : (uint)i + gapLen;
+            return buffer[phys];
+        };
+
+        int i = (int)linePtr;
+        int end = i + lineLen;
+
+        while (i < end && col < lineWidth) {
+            char c = physChar(i);
+
+            // { ... } block comment
+            if (c == '{') {
+                int start = i++;
+                while (i < end && physChar(i) != '}') i++;
+                if (i < end) i++;
+                for (int j = start; j < i && col < lineWidth; j++)
+                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(4));
+                continue;
+            }
+            // (* ... *) comment
+            if (c == '(' && i+1 < end && physChar(i+1) == '*') {
+                int start = i; i += 2;
+                while (i < end) {
+                    if (physChar(i) == '*' && i+1 < end && physChar(i+1) == ')') { i += 2; break; }
+                    i++;
+                }
+                for (int j = start; j < i && col < lineWidth; j++)
+                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(4));
+                continue;
+            }
+            // // line comment
+            if (c == '/' && i+1 < end && physChar(i+1) == '/') {
+                for (int j = i; j < end && col < lineWidth; j++)
+                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(4));
+                i = end;
+                continue;
+            }
+            // String/char literal '...'
+            if (c == '\'') {
+                int start = i++;
+                while (i < end) {
+                    if (physChar(i++) == '\'') break;
+                }
+                for (int j = start; j < i && col < lineWidth; j++)
+                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(5));
+                continue;
+            }
+            // Hex or decimal number
+            if (isdigit((unsigned char)c) ||
+                (c == '$' && i+1 < end && isxdigit((unsigned char)physChar(i+1)))) {
+                int start = i;
+                while (i < end && (isalnum((unsigned char)physChar(i)) || physChar(i) == '.')) i++;
+                for (int j = start; j < i && col < lineWidth; j++)
+                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(6));
+                continue;
+            }
+            // Identifier or keyword
+            if (isalpha((unsigned char)c) || c == '_') {
+                int start = i;
+                while (i < end && (isalnum((unsigned char)physChar(i)) || physChar(i) == '_')) i++;
+                // Copy word into a small buffer for keyword check
+                char word[64]; int wlen = std::min(i - start, 63);
+                for (int j = 0; j < wlen; j++) word[j] = physChar(start + j);
+                word[wlen] = '\0';
+                uchar tok = isPascalKeyword(word, wlen) ? 3 : 1;
+                for (int j = start; j < i && col < lineWidth; j++)
+                    putChar(physChar(j), linePtr + (j - (int)linePtr), mapColor(tok));
+                continue;
+            }
+            // Everything else
+            putChar(c, linePtr + (i - (int)linePtr), mapColor(1));
+            i++;
+        }
+        // Pad remaining columns with spaces in normal colour
+        while (col < lineWidth)
+            buf.moveChar(col++, ' ', clrNormal, 1);
+    }
+};
+
 // ── Editor Window ─────────────────────────────────────────────────────────
 class TEditorWindow : public TWindow {
 public:
-    TFileEditor* editor;
-    TIndicator*  indicator;
+    TPascalEditor* editor;
+    TIndicator*    indicator;
     char         filename[MAXPATH];
 
     TEditorWindow(TRect bounds, const char* aFile)
@@ -161,8 +371,8 @@ public:
         } else {
             filename[0] = '\0';
         }
-        editor = new TFileEditor(r, hbar, vbar, indicator,
-                                 filename[0] ? TStringView(filename) : TStringView());
+        editor = new TPascalEditor(r, hbar, vbar, indicator,
+                                   filename[0] ? TStringView(filename) : TStringView());
         insert(editor);
         editor->select();
     }

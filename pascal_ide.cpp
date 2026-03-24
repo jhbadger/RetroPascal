@@ -21,6 +21,8 @@
 #define Uses_TInputLine
 #define Uses_TKeys
 #define Uses_TLabel
+#define Uses_TCheckBoxes
+#define Uses_TSItem
 #define Uses_TMenuBar
 #define Uses_TMenuItem
 #define Uses_TProgram
@@ -38,10 +40,15 @@
 #define Uses_TDrawBuffer
 #define Uses_TScroller
 #define Uses_TScreen
+#define Uses_TFindDialogRec
+#define Uses_TReplaceDialogRec
+#define Uses_TEditorDialog
 #define Uses_TColorAttr
 #include <tvision/tv.h>
 
 #include <cstring>
+#include <cstdarg>
+#include <cstdio>
 #include <string>
 #include <algorithm>
 #include <cctype>
@@ -64,7 +71,8 @@ const ushort
 // ── Run pascal interpreter ────────────────────────────────────────────────
 // Suspends tvision, runs the interpreter in the foreground (so the program
 // can use stdin/stdout freely), then resumes tvision.
-static void runPascalInteractive(const char* filepath) {
+// Returns 0 if success, or the 1-based error line number on failure.
+static int runPascalInteractive(const char* filepath) {
     // TProgram::dosShell() suspends tvision and restores the terminal.
     // We replicate what it does: suspend screen, fork+exec, wait, resume.
     TScreen::suspend();
@@ -90,35 +98,83 @@ static void runPascalInteractive(const char* filepath) {
         }
     }
 
-    {
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Child: inherit stdin/stdout/stderr from the terminal.
-            // execlp searches PATH if interp has no '/' in it.
-            execlp(interp.c_str(), interp.c_str(), filepath, nullptr);
-            perror("execlp: pascal not found");
-            _exit(127);
-        } else if (pid > 0) {
-            int status;
-            waitpid(pid, &status, 0);
+    // Pipe for stderr so we can parse the error line number.
+    // stdout and stdin remain connected to the terminal.
+    int errpipe[2] = {-1,-1};
+    pipe(errpipe);
+
+    int errorLine = 0;
+    bool failed   = false;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child: stderr → pipe; stdin+stdout → terminal
+        close(errpipe[0]);
+        dup2(errpipe[1], STDERR_FILENO);
+        close(errpipe[1]);
+        execlp(interp.c_str(), interp.c_str(), filepath, nullptr);
+        perror("execlp: pascal not found");
+        _exit(127);
+    } else if (pid > 0) {
+        close(errpipe[1]);
+        // Read stderr
+        std::string errout;
+        char ebuf[1024]; ssize_t n;
+        while ((n = read(errpipe[0], ebuf, sizeof(ebuf))) > 0)
+            errout.append(ebuf, n);
+        close(errpipe[0]);
+
+        int status = 0;
+        waitpid(pid, &status, 0);
+        failed = !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+        if (failed) {
+            // Print captured stderr to the terminal so the user can see it
+            if (!errout.empty()) {
+                fwrite(errout.c_str(), 1, errout.size(), stderr);
+                fflush(stderr);
+            }
             if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
                 printf("\n[Process exited with code %d]\n", WEXITSTATUS(status));
             else if (!WIFEXITED(status))
                 printf("\n[Process terminated abnormally]\n");
-        } else {
-            perror("fork");
+
+            // Parse "at line N" or "line N" from the error output
+            // The pascal interpreter emits: "Error: <msg> at line N"
+            // Parse error line: interpreter emits "Error: ... at line N"
+            auto parseErrorLine = [](const std::string& s) -> int {
+                // Look for "at line N" first (parse errors)
+                size_t pos = s.find("at line ");
+                if (pos != std::string::npos) {
+                    size_t numStart = pos + 8;
+                    if (numStart < s.size() && isdigit((unsigned char)s[numStart]))
+                        return std::stoi(s.substr(numStart));
+                }
+                // Fallback: any "line N"
+                pos = 0;
+                while ((pos = s.find("line ", pos)) != std::string::npos) {
+                    size_t numStart = pos + 5;
+                    if (numStart < s.size() && isdigit((unsigned char)s[numStart]))
+                        return std::stoi(s.substr(numStart));
+                    pos++;
+                }
+                return 0;
+            };
+            errorLine = parseErrorLine(errout);
         }
+    } else {
+        close(errpipe[0]); close(errpipe[1]);
+        perror("fork");
     }
 
     printf("\n--- Press Enter to return to the IDE ---");
     fflush(stdout);
-    // Wait for Enter
     int c;
     while ((c = getchar()) != '\n' && c != EOF) {}
 
     TScreen::resume();
-    // Force a full redraw
     TProgram::application->redraw();
+    return failed ? errorLine : 0;
 }
 
 // ── Output dialog ─────────────────────────────────────────────────────────
@@ -163,6 +219,154 @@ public:
 // tokenise on the fly, and call TScreenCell::moveChar with the right
 // colour index for each character.
 
+
+// ── editorDialog implementation ───────────────────────────────────────────
+// tvision's TEditor calls this function pointer for all user interaction:
+// find dialog, replace dialog, error messages, save prompts, etc.
+// The default (defEditorDialog) just returns cmCancel for everything.
+// We must supply a real implementation and assign it to TEditor::editorDialog.
+
+static ushort pascalEditorDialog(int dialog, ...) {
+    va_list args;
+    va_start(args, dialog);
+
+    ushort result = cmCancel;
+
+    switch (dialog) {
+
+        case edFind: {
+            TFindDialogRec* rec = va_arg(args, TFindDialogRec*);
+            TDialog* dlg = new TDialog(TRect(0,0,50,10), " Find ");
+            dlg->options |= ofCentered;
+
+            TInputLine* findInp = new TInputLine(TRect(2,3,48,4), maxFindStrLen);
+            dlg->insert(new TLabel(TRect(2,2,12,3), "~T~ext:", findInp));
+            dlg->insert(findInp);
+
+            TCheckBoxes* opts = new TCheckBoxes(TRect(2,5,48,7),
+                new TSItem("~C~ase sensitive",
+                new TSItem("~W~hole words only",
+                nullptr)));
+            dlg->insert(opts);
+
+            dlg->insert(new TButton(TRect(12,8,22,9), " ~O~K ",     cmOK,     bfDefault));
+            dlg->insert(new TButton(TRect(28,8,38,9), " ~C~ancel ", cmCancel, bfNormal));
+
+            // Set data after inserting
+            findInp->setData((void*)rec->find);
+            ushort optVal = rec->options & (efCaseSensitive | efWholeWordsOnly);
+            opts->setData(&optVal);
+            dlg->selectNext(False);
+
+            if (TProgram::deskTop->execView(dlg) != cmCancel) {
+                findInp->getData(rec->find);
+                opts->getData(&optVal);
+                rec->options = (rec->options & ~(efCaseSensitive|efWholeWordsOnly)) | optVal;
+                result = cmOK;
+            }
+            TObject::destroy(dlg);
+            break;
+        }
+
+        case edReplace: {
+            TReplaceDialogRec* rec = va_arg(args, TReplaceDialogRec*);
+            TDialog* dlg = new TDialog(TRect(0,0,54,14), " Replace ");
+            dlg->options |= ofCentered;
+
+            // Insert views first, then set data
+            TInputLine* findInp = new TInputLine(TRect(2,3,52,4), maxFindStrLen);
+            dlg->insert(new TLabel(TRect(2,2,14,3), "~F~ind:", findInp));
+            dlg->insert(findInp);
+
+            TInputLine* replInp = new TInputLine(TRect(2,6,52,7), maxReplaceStrLen);
+            dlg->insert(new TLabel(TRect(2,5,20,6), "~R~eplace with:", replInp));
+            dlg->insert(replInp);
+
+            TCheckBoxes* opts = new TCheckBoxes(TRect(2,8,52,11),
+                new TSItem("~C~ase sensitive",
+                new TSItem("~W~hole words only",
+                new TSItem("~P~rompt on replace",
+                new TSItem("~A~ll occurrences",
+                nullptr)))));
+            dlg->insert(opts);
+
+            dlg->insert(new TButton(TRect(8,12,20,13),  " ~O~K ",     cmOK,     bfDefault));
+            dlg->insert(new TButton(TRect(24,12,38,13), " ~C~ancel ", cmCancel, bfNormal));
+
+            // Set data after inserting so drawView works correctly
+            findInp->setData((void*)rec->find);
+            replInp->setData((void*)rec->replace);
+            ushort optVal = rec->options &
+                (efCaseSensitive|efWholeWordsOnly|efPromptOnReplace|efReplaceAll);
+            opts->setData(&optVal);
+            dlg->selectNext(False);
+
+            if (TProgram::deskTop->execView(dlg) != cmCancel) {
+                findInp->getData(rec->find);
+                replInp->getData(rec->replace);
+                opts->getData(&optVal);
+                rec->options = (rec->options &
+                    ~(efCaseSensitive|efWholeWordsOnly|efPromptOnReplace|efReplaceAll))
+                    | optVal;
+                result = cmOK;
+            }
+            TObject::destroy(dlg);
+            break;
+        }
+
+        case edReplacePrompt: {
+            // Ask user: replace this occurrence?
+            result = messageBox(" Replace this occurrence? ",
+                                mfYesNoCancel | mfInformation);
+            break;
+        }
+
+        case edSearchFailed: {
+            messageBox(" Search string not found. ", mfOKButton | mfInformation);
+            result = cmOK;
+            break;
+        }
+
+        case edOutOfMemory: {
+            messageBox(" Not enough memory for this operation. ", mfOKButton | mfError);
+            result = cmOK;
+            break;
+        }
+
+        case edSaveModify: {
+            // "file has been modified — save?"
+            const char* fname = va_arg(args, const char*);
+            char msg[128];
+            snprintf(msg, sizeof(msg), " %s has been modified. Save? ", fname ? fname : "File");
+            result = messageBox(msg, mfYesNoCancel | mfInformation);
+            break;
+        }
+
+        case edSaveAs: {
+            // Prompt for save-as filename
+            const char* fname = va_arg(args, const char*);
+            TFileDialog* dlg = new TFileDialog("*.pas", " Save As ",
+                                               "~N~ame", fdOKButton, 100);
+            result = cmCancel;
+            if (TProgram::deskTop->execView(dlg) != cmCancel) {
+                char buf[MAXPATH] = {};
+                dlg->getFileName(buf);
+                if (fname) strncpy(const_cast<char*>(fname), buf, MAXPATH-1);
+                result = cmOK;
+            }
+            TObject::destroy(dlg);
+            break;
+        }
+
+        default:
+            result = cmCancel;
+            break;
+    }
+
+    va_end(args);
+    return result;
+}
+
 static const char* PASCAL_KEYWORDS[] = {
     "program","unit","uses","interface","implementation","initialization","finalization",
     "var","const","type","label","procedure","function","begin","end","forward",
@@ -198,8 +402,11 @@ public:
                   TScrollBar* vScrollBar,
                   TIndicator* indicator,
                   TStringView filename)
-        : TFileEditor(bounds, hScrollBar, vScrollBar, indicator, filename)
+        : TFileEditor(bounds, hScrollBar, vScrollBar, indicator, filename),
+          errorLine(0)
     {}
+
+    int errorLine;  // 1-based; 0 = no error
 
     // Override mapColor so the base-class draw() uses our background colour
     // for normal (index 1) and selected (index 2) text.
@@ -340,6 +547,87 @@ public:
             // Advance to next line
             lineStart = lineEnd + 1;  // +1 to skip the '\n'
         }
+
+        // 3. Error line highlight: paint that row with a red background.
+        if (errorLine > 0) {
+            int errRow = (errorLine - 1) - delta.y;
+            if (errRow >= 0 && errRow < size.y) {
+                // Find the start byte of the error line in the gap buffer
+                uint ls = 0; int ln = 0;
+                while (ln < errorLine - 1 && ls < bufLen) {
+                    if (gapChar(ls) == '\n') ln++;
+                    ls++;
+                }
+                uint le = ls;
+                while (le < bufLen && gapChar(le) != '\n') le++;
+
+                TColorAttr errNorm = TColorAttr(TColorRGB(0xFFFFFF), TColorRGB(0xAA0000));
+                TColorAttr errKw   = TColorAttr(TColorRGB(0xFFFF55), TColorRGB(0xAA0000));
+                TColorAttr errStr  = TColorAttr(TColorRGB(0x55FF55), TColorRGB(0xAA0000));
+                TColorAttr errCmt  = TColorAttr(TColorRGB(0x55FFFF), TColorRGB(0xAA0000));
+
+                // Build a full-width TDrawBuffer for the error line
+                TDrawBuffer b;
+                // Fill with spaces first
+                b.moveChar(0, ' ', errNorm, size.x);
+
+                // Then write characters from the line (accounting for h-scroll)
+                int col = 0;
+                uint i2 = ls;
+                while (i2 < le && col < size.x) {
+                    int logCol = (int)(i2 - ls); // column in the logical line
+                    if (logCol < delta.x) { i2++; continue; } // before scroll
+                    int sc = logCol - delta.x;
+                    if (sc >= size.x) break;
+
+                    char ch = gapChar(i2);
+                    TColorAttr ca = errNorm;
+
+                    // Detect token type for colour-on-red
+                    if (ch == '\'' ) {
+                        ca = errStr;
+                    } else if (ch == '{') {
+                        ca = errCmt;
+                    } else if (isalpha((unsigned char)ch) || ch == '_') {
+                        uint ws = i2;
+                        while (i2 < le && (isalnum((unsigned char)gapChar(i2)) || gapChar(i2) == '_')) i2++;
+                        char w[64]; int wl = std::min((int)(i2-ws), 63);
+                        for (int k = 0; k < wl; k++) w[k] = gapChar(ws+k); w[wl] = 0;
+                        ca = isPascalKeyword(w, wl) ? errKw : errNorm;
+                        for (uint j = ws; j < i2; j++) {
+                            int sc2 = (int)(j - ls) - delta.x;
+                            if (sc2 >= 0 && sc2 < size.x)
+                                b.moveChar(sc2, gapChar(j), ca, 1);
+                        }
+                        continue;
+                    }
+                    b.moveChar(sc, ch, ca, 1);
+                    i2++;
+                }
+
+                // Write the whole line in one call
+                writeBuf(0, errRow, size.x, 1, b);
+            }
+        }
+    }
+    void handleEvent(TEvent& event) override {
+        // Convert key shortcuts to commands so the menu and keys both work
+        if (event.what == evKeyDown) {
+            switch (event.keyDown.keyCode) {
+                case kbCtrlF: event.what = evCommand; event.message.command = cmFind;        break;
+                case kbCtrlH: event.what = evCommand; event.message.command = cmReplace;     break;
+                case kbF7:    event.what = evCommand; event.message.command = cmSearchAgain; break;
+                default: break;
+            }
+        }
+        if (event.what == evCommand) {
+            switch (event.message.command) {
+                case cmFind:        find();            clearEvent(event); return;
+                case cmReplace:     replace();         clearEvent(event); return;
+                case cmSearchAgain: doSearchReplace(); clearEvent(event); return;
+            }
+        }
+        TFileEditor::handleEvent(event);
     }
 };
 
@@ -505,6 +793,21 @@ TPascalIDE::TPascalIDE()
                 &TPascalIDE::initMenuBar,
                 &TPascalIDE::initDeskTop)
 {
+    // These editor commands start disabled; TEditor enables them automatically
+    // when an editor is focused. Without this initial disableCommands() call,
+    // tvision never registers them and TEditor cannot enable them.
+    TCommandSet editorCmds;
+    editorCmds += cmFind;
+    editorCmds += cmReplace;
+    editorCmds += cmSearchAgain;
+    editorCmds += cmCut;
+    editorCmds += cmCopy;
+    editorCmds += cmPaste;
+    editorCmds += cmUndo;
+    editorCmds += cmClear;
+    disableCommands(editorCmds);
+    // Install the editor dialog handler
+    TEditor::editorDialog = pascalEditorDialog;
     newFile();
 }
 
@@ -528,6 +831,10 @@ TMenuBar* TPascalIDE::initMenuBar(TRect r) {
             *new TMenuItem("~G~o to Line...", cmGotoLine,   kbNoKey)                              +
         *new TSubMenu("~R~un", kbAltR) +
             *new TMenuItem("~R~un",           cmRunProgram, kbF9,       hcNoContext, "F9")        +
+        *new TSubMenu("~S~earch", kbAltS) +
+            *new TMenuItem("~F~ind...",        cmFind,        kbCtrlF,    hcNoContext, "Ctrl-F") +
+            *new TMenuItem("~R~eplace...",     cmReplace,     kbCtrlH,    hcNoContext, "Ctrl-H") +
+            *new TMenuItem("~A~gain",          cmSearchAgain, kbF7,       hcNoContext, "F7")     +
         *new TSubMenu("~H~elp", kbAltH) +
             *new TMenuItem("~A~bout...",      cmAbout,      kbNoKey)
     );
@@ -539,6 +846,7 @@ TStatusLine* TPascalIDE::initStatusLine(TRect r) {
         *new TStatusDef(0, 0xFFFF) +
             *new TStatusItem("~F2~ Save",    kbF2,   cmSaveFile)   +
             *new TStatusItem("~F3~ Open",    kbF3,   cmOpenFile)   +
+            *new TStatusItem("~F7~ Again",   kbF7,   cmSearchAgain) +
             *new TStatusItem("~F9~ Run",     kbF9,   cmRunProgram) +
             *new TStatusItem("~F10~ Menu",   kbF10,  cmMenu)       +
             *new TStatusItem("~Alt-X~ Exit", kbAltX, cmQuit)
@@ -593,8 +901,16 @@ void TPascalIDE::runProgram() {
     if (!w) { messageBox(" No editor open. ", mfError | mfOKButton); return; }
     std::string path = w->getFilePath();
     if (path.empty()) return;
+    // Clear any previous error highlight
+    w->editor->errorLine = 0;
     // Run interactively so the program can use stdin/stdout
-    runPascalInteractive(path.c_str());
+    int errLine = runPascalInteractive(path.c_str());
+    // If there was an error, highlight that line in the editor
+    if (errLine > 0) {
+        w->editor->errorLine = errLine;
+        w->jumpToLine(errLine - 1);  // scroll to error line first
+        w->drawView();               // redraw the whole window (triggers draw())
+    }
 }
 
 void TPascalIDE::showAbout() {

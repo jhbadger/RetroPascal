@@ -23,7 +23,6 @@
 #define Uses_TLabel
 #define Uses_TMenuBar
 #define Uses_TMenuItem
-#define Uses_TMsgBoxParam
 #define Uses_TProgram
 #define Uses_TRect
 #define Uses_TScrollBar
@@ -38,10 +37,12 @@
 #define Uses_otstream
 #define Uses_TDrawBuffer
 #define Uses_TScroller
+#define Uses_TScreen
 #include <tvision/tv.h>
 
 #include <cstring>
 #include <string>
+#include <fstream>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -58,60 +59,56 @@ const ushort
     cmGotoLine    = 207;
 
 // ── Run pascal interpreter ────────────────────────────────────────────────
-struct RunResult { std::string output; bool success; };
+// Suspends tvision, runs the interpreter in the foreground (so the program
+// can use stdin/stdout freely), then resumes tvision.
+static void runPascalInteractive(const char* filepath) {
+    // TProgram::dosShell() suspends tvision and restores the terminal.
+    // We replicate what it does: suspend screen, fork+exec, wait, resume.
+    TScreen::suspend();
 
-static RunResult runPascal(const char* filepath) {
-    RunResult res;
+    // Print a separator so the user knows the program is starting
+    printf("\n--- Running %s ---\n\n", filepath);
+    fflush(stdout);
+
     const char* candidates[] = { "./pascal", "pascal", nullptr };
     std::string interp;
     for (int i = 0; candidates[i]; i++)
         if (access(candidates[i], X_OK) == 0) { interp = candidates[i]; break; }
+
     if (interp.empty()) {
-        res.output  = "Error: 'pascal' interpreter not found.\n"
-                      "Place it in the same directory as pascal_ide.";
-        res.success = false;
-        return res;
+        printf("Error: 'pascal' interpreter not found.\n"
+               "Place it in the same directory as pascal_ide.\n");
+    } else {
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child: inherit stdin/stdout/stderr from the terminal
+            execlp(interp.c_str(), interp.c_str(), filepath, nullptr);
+            perror("execlp");
+            _exit(127);
+        } else if (pid > 0) {
+            int status;
+            waitpid(pid, &status, 0);
+            if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+                printf("\n[Process exited with code %d]\n", WEXITSTATUS(status));
+            else if (!WIFEXITED(status))
+                printf("\n[Process terminated abnormally]\n");
+        } else {
+            perror("fork");
+        }
     }
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        res.output = "pipe() failed"; res.success = false; return res;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        res.output = "fork() failed"; res.success = false; return res;
-    }
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        int nfd = open("/dev/null", O_RDONLY);
-        if (nfd >= 0) { dup2(nfd, STDIN_FILENO); close(nfd); }
-        close(pipefd[1]);
-        execlp(interp.c_str(), interp.c_str(), filepath, nullptr);
-        _exit(127);
-    }
-    close(pipefd[1]);
-    char buf[4096]; ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
-        res.output.append(buf, n);
-    close(pipefd[0]);
-    int status = 0;
-    for (int ms = 0; ms < 10000; ms += 10) {
-        if (waitpid(pid, &status, WNOHANG) == pid) goto done;
-        usleep(10000);
-    }
-    kill(pid, SIGKILL); waitpid(pid, &status, 0);
-    res.output += "\n[Timed out after 10s]";
-done:
-    res.success = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    return res;
+
+    printf("\n--- Press Enter to return to the IDE ---");
+    fflush(stdout);
+    // Wait for Enter
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) {}
+
+    TScreen::resume();
+    // Force a full redraw
+    TProgram::application->redraw();
 }
 
 // ── Output dialog ─────────────────────────────────────────────────────────
-// Inherit only from TDialog (TWindowInit is a virtual base inside it).
-// Initialize TWindowInit explicitly in the ctor initializer list — this is
-// the standard Turbo Vision idiom (see tvision discussion #119).
-
 class TOutputDialog : public TDialog {
 public:
     TOutputDialog(const std::string& text, bool success)
@@ -120,21 +117,17 @@ public:
                   success ? " Program Output " : " Output / Errors ")
     {
         options |= ofCentered;
-
         TScrollBar* vbar = new TScrollBar(TRect(size.x-2, 1,        size.x-1, size.y-3));
         TScrollBar* hbar = new TScrollBar(TRect(1,        size.y-3, size.x-2, size.y-2));
         insert(vbar);
         insert(hbar);
-
         TRect r(1, 1, size.x-2, size.y-3);
         auto* term = new TTerminal(r, hbar, vbar, 32768);
         insert(term);
-
         otstream os(term);
         os << text;
         if (text.empty() || text.back() != '\n') os << '\n';
         os.flush();
-
         insert(new TButton(TRect((size.x-10)/2, size.y-2, (size.x+10)/2, size.y-1),
                            "  ~O~K  ", cmOK, bfDefault));
         selectNext(False);
@@ -142,8 +135,6 @@ public:
 };
 
 // ── Editor Window ─────────────────────────────────────────────────────────
-// Same pattern: inherit only TWindow, initialize TWindowInit in ctor list.
-
 class TEditorWindow : public TWindow {
 public:
     TFileEditor* editor;
@@ -157,25 +148,19 @@ public:
                   wnNoNumber)
     {
         options |= ofTileable;
-
         TScrollBar* vbar = new TScrollBar(TRect(size.x-1, 1,        size.x,   size.y-1));
         TScrollBar* hbar = new TScrollBar(TRect(1,        size.y-1, size.x-1, size.y));
         insert(vbar);
         insert(hbar);
-
         indicator = new TIndicator(TRect(0, size.y-1, 12, size.y));
         insert(indicator);
-
         TRect r(1, 1, size.x-1, size.y-1);
-
         if (aFile && *aFile) {
             strncpy(filename, aFile, MAXPATH-1);
             filename[MAXPATH-1] = '\0';
         } else {
             filename[0] = '\0';
         }
-
-        // TFileEditor(bounds, hScrollBar, vScrollBar, indicator, fileName)
         editor = new TFileEditor(r, hbar, vbar, indicator,
                                  filename[0] ? TStringView(filename) : TStringView());
         insert(editor);
@@ -186,9 +171,28 @@ public:
         return filename[0] ? filename : " Untitled ";
     }
 
+    // Write gap buffer to disk directly (works for both new and existing files)
+    bool writeBufferToFile(const char* path) {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        // Gap buffer layout: [0..curPtr) | gap | (curPtr+gapLen..bufLen+gapLen)
+        if (editor->curPtr > 0)
+            f.write(editor->buffer, editor->curPtr);
+        uint postStart = editor->curPtr + editor->gapLen;
+        uint total     = editor->bufLen + editor->gapLen;
+        if (postStart < total)
+            f.write(editor->buffer + postStart, total - postStart);
+        return f.good();
+    }
+
     bool save() {
         if (filename[0] == '\0') return saveAs();
-        return editor->saveFile() != 0;
+        if (writeBufferToFile(filename)) {
+            editor->modified = False;
+            return true;
+        }
+        messageBox(" Error saving file! ", mfError | mfOKButton);
+        return false;
     }
 
     bool saveAs() {
@@ -199,12 +203,34 @@ public:
             char buf[MAXPATH] = {};
             dlg->getFileName(buf);
             strncpy(filename, buf, MAXPATH-1);
-            editor->saveFile();
-            ok = true;
-            if (frame) frame->drawView();
+            if (writeBufferToFile(filename)) {
+                editor->modified = False;
+                ok = true;
+                if (frame) frame->drawView();
+            } else {
+                messageBox(" Error saving file! ", mfError | mfOKButton);
+            }
         }
         TObject::destroy(dlg);
         return ok;
+    }
+
+    // Override valid() so that cmQuit / cmClose prompt to save if modified,
+    // then allow the close. Without this, TEditor blocks quit silently.
+    Boolean valid(ushort command) override {
+        if (command == cmQuit || command == cmClose) {
+            if (editor->modified) {
+                // Ask user
+                int r = messageBox(
+                    " File has unsaved changes. Save before closing?",
+                    mfYesNoCancel
+                );
+                if (r == cmYes)   return Boolean(save());
+                if (r == cmNo)    return True;
+                return False; // Cancel
+            }
+        }
+        return TWindow::valid(command);
     }
 
     std::string getFilePath() {
@@ -216,9 +242,8 @@ public:
         return std::string(filename);
     }
 
-    // Jump to 0-based line by scanning the gap buffer for newlines
     void jumpToLine(int targetLine) {
-        if (targetLine <= 0) { editor->setCurPtr(0, 0); return; }
+        if (targetLine <= 0) { editor->setCurPtr(0, 0); editor->drawView(); return; }
         uint line = 0;
         uint len  = editor->bufLen;
         for (uint i = 0; i < len; i++) {
@@ -232,24 +257,22 @@ public:
                 }
             }
         }
-        // If line not found, go to end
         editor->setCurPtr(len, 0);
         editor->drawView();
     }
 
     void handleEvent(TEvent& event) override {
-        TWindow::handleEvent(event);
         if (event.what == evCommand) {
             switch (event.message.command) {
-                case cmSaveFile:   save();   clearEvent(event); break;
-                case cmSaveFileAs: saveAs(); clearEvent(event); break;
+                case cmSaveFile:   save();   clearEvent(event); return;
+                case cmSaveFileAs: saveAs(); clearEvent(event); return;
             }
         }
+        TWindow::handleEvent(event);
     }
 };
 
 // ── Application ───────────────────────────────────────────────────────────
-
 class TPascalIDE : public TApplication {
 public:
     TPascalIDE();
@@ -317,18 +340,20 @@ TEditorWindow* TPascalIDE::activeEditor() {
 }
 
 void TPascalIDE::handleEvent(TEvent& event) {
-    TApplication::handleEvent(event);
+    // Handle our custom commands first; let everything else (cmQuit etc)
+    // fall through to TApplication which knows how to handle them.
     if (event.what == evCommand) {
         switch (event.message.command) {
-            case cmNewFile:    newFile();    clearEvent(event); break;
-            case cmOpenFile:   openFile();   clearEvent(event); break;
-            case cmSaveFile:   saveFile();   clearEvent(event); break;
-            case cmSaveFileAs: saveFileAs(); clearEvent(event); break;
-            case cmRunProgram: runProgram(); clearEvent(event); break;
-            case cmAbout:      showAbout();  clearEvent(event); break;
-            case cmGotoLine:   gotoLine();   clearEvent(event); break;
+            case cmNewFile:    newFile();    clearEvent(event); return;
+            case cmOpenFile:   openFile();   clearEvent(event); return;
+            case cmSaveFile:   saveFile();   clearEvent(event); return;
+            case cmSaveFileAs: saveFileAs(); clearEvent(event); return;
+            case cmRunProgram: runProgram(); clearEvent(event); return;
+            case cmAbout:      showAbout();  clearEvent(event); return;
+            case cmGotoLine:   gotoLine();   clearEvent(event); return;
         }
     }
+    TApplication::handleEvent(event);
 }
 
 void TPascalIDE::newFile() {
@@ -358,10 +383,8 @@ void TPascalIDE::runProgram() {
     if (!w) { messageBox(" No editor open. ", mfError | mfOKButton); return; }
     std::string path = w->getFilePath();
     if (path.empty()) return;
-    RunResult res = runPascal(path.c_str());
-    auto* dlg = new TOutputDialog(res.output, res.success);
-    deskTop->execView(dlg);
-    TObject::destroy(dlg);
+    // Run interactively so the program can use stdin/stdout
+    runPascalInteractive(path.c_str());
 }
 
 void TPascalIDE::showAbout() {

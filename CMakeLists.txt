@@ -33,8 +33,94 @@ else()
     endif()
 endif()
 
+# ── SDL2 detection (optional — graphics support) ─────────────────────────
+# Try multiple methods so it works on macOS (Homebrew), Linux, and Termux.
+set(PASCAL_HAS_SDL2 FALSE)
+
+# Method 1: sdl2-config script (Homebrew on macOS, manual installs)
+find_program(SDL2_CONFIG sdl2-config)
+if(SDL2_CONFIG)
+    execute_process(COMMAND ${SDL2_CONFIG} --cflags
+        OUTPUT_VARIABLE SDL2_RAW_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${SDL2_CONFIG} --libs
+        OUTPUT_VARIABLE SDL2_RAW_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${SDL2_CONFIG} --prefix
+        OUTPUT_VARIABLE SDL2_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(SDL2_RAW_CFLAGS AND SDL2_RAW_LIBS)
+        message(STATUS "SDL2 found via sdl2-config — building with graphics support")
+        message(STATUS "  SDL2 prefix: ${SDL2_PREFIX}")
+        message(STATUS "  SDL2 cflags: ${SDL2_RAW_CFLAGS}")
+        set(PASCAL_HAS_SDL2 TRUE)
+        set(PASCAL_SDL2_METHOD "sdl2-config")
+        # Extract include directories from cflags (-I/some/path)
+        string(REGEX MATCHALL "-I([^ ]+)" SDL2_INCLUDE_MATCHES "${SDL2_RAW_CFLAGS}")
+        set(SDL2_INCLUDE_DIRS_LIST "")
+        foreach(m ${SDL2_INCLUDE_MATCHES})
+            string(REGEX REPLACE "^-I" "" inc "${m}")
+            list(APPEND SDL2_INCLUDE_DIRS_LIST "${inc}")
+        endforeach()
+        # Also add prefix/include as a fallback
+        if(SDL2_PREFIX)
+            list(APPEND SDL2_INCLUDE_DIRS_LIST "${SDL2_PREFIX}/include")
+        endif()
+        set(SDL2_INCLUDE_DIRS_FROM_CONFIG "${SDL2_INCLUDE_DIRS_LIST}")
+        set(SDL2_LDFLAGS_FROM_CONFIG "${SDL2_RAW_LIBS}")
+    endif()
+endif()
+
+# Method 2: CMake find_package
+if(NOT PASCAL_HAS_SDL2)
+    find_package(SDL2 QUIET)
+    if(SDL2_FOUND OR TARGET SDL2::SDL2)
+        message(STATUS "SDL2 found via find_package — building with graphics support")
+        set(PASCAL_HAS_SDL2 TRUE)
+        set(SDL2_CFLAGS "")
+        set(SDL2_LDFLAGS "")
+    endif()
+endif()
+
+# Method 3: pkg-config (Linux, Termux)
+if(NOT PASCAL_HAS_SDL2)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SDL2PC QUIET sdl2)
+        if(SDL2PC_FOUND)
+            message(STATUS "SDL2 found via pkg-config — building with graphics support")
+            set(PASCAL_HAS_SDL2 TRUE)
+            set(SDL2_CFLAGS "${SDL2PC_CFLAGS}")
+            set(SDL2_LDFLAGS "${SDL2PC_LDFLAGS}")
+        endif()
+    endif()
+endif()
+
+if(NOT PASCAL_HAS_SDL2)
+    message(STATUS "SDL2 not found — building pascal interpreter without graphics support")
+endif()
+
 # ── pascal interpreter ────────────────────────────────────────────────────
-add_executable(pascal pascal_interpreter.cpp)
+add_executable(pascal pascal_interpreter.cpp pascal_graphics.h)
+
+if(PASCAL_HAS_SDL2)
+    target_compile_definitions(pascal PRIVATE HAVE_SDL2)
+    if(TARGET SDL2::SDL2)
+        # CMake imported target (best case)
+        target_link_libraries(pascal PRIVATE SDL2::SDL2)
+    elseif(SDL2_FOUND AND SDL2_INCLUDE_DIRS)
+        # find_package result without imported target
+        target_include_directories(pascal PRIVATE ${SDL2_INCLUDE_DIRS})
+        target_link_libraries(pascal PRIVATE ${SDL2_LIBRARIES})
+    elseif(SDL2PC_FOUND)
+        # pkg-config result
+        target_include_directories(pascal PRIVATE ${SDL2PC_INCLUDE_DIRS})
+        target_link_libraries(pascal PRIVATE ${SDL2PC_LINK_LIBRARIES})
+    else()
+        # sdl2-config path: use extracted include dirs and raw link flags
+        message(STATUS "Applying SDL2 include dirs: ${SDL2_INCLUDE_DIRS_FROM_CONFIG}")
+        target_include_directories(pascal PRIVATE ${SDL2_INCLUDE_DIRS_FROM_CONFIG})
+        separate_arguments(SDL2_LDFLAGS_LIST UNIX_COMMAND "${SDL2_LDFLAGS_FROM_CONFIG}")
+        target_link_options(pascal PRIVATE ${SDL2_LDFLAGS_LIST})
+    endif()
+endif()
 
 # ── pascal_ide executable ─────────────────────────────────────────────────
 add_executable(pascal_ide pascal_ide.cpp)

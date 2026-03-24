@@ -30,6 +30,8 @@
 #include <stdexcept>
 #include <cmath>
 #include <cassert>
+#include <ctime>
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
 #include <variant>
@@ -116,9 +118,6 @@ class Lexer {
                 advance(); advance();
                 while (pos < src.size() && !(peek() == '*' && peek(1) == ')')) advance();
                 if (pos < src.size()) { advance(); advance(); }
-            }
-						else if (c == '#' && peek(1) == '!') {
-                while (pos < src.size() && peek() != '\n') advance();
             }
             else if (c == '/' && peek(1) == '/') {
                 while (pos < src.size() && peek() != '\n') advance();
@@ -742,6 +741,8 @@ struct Environment {
     bool has_local(const std::string& name) { return vars.count(name) > 0; }
 };
 
+#include "pascal_graphics.h"
+
 // ─────────────────────────────────────────────
 //  Interpreter
 // ─────────────────────────────────────────────
@@ -765,6 +766,13 @@ class Interpreter {
         if (auto* n = dynamic_cast<VarNode*>(node.get())) {
             std::string lo = n->name;
             std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            // Zero-argument graphics functions arrive as VarNodes (no parentheses)
+            // Try graphics dispatch first for known zero-arg names
+            {
+                auto [handled, gval] = evalGraphCall(lo, {},
+                    [&](const ASTPtr& n2) { return eval(n2, env); });
+                if (handled) return gval;
+            }
             return env->get(lo);
         }
 
@@ -919,6 +927,12 @@ class Interpreter {
             for (auto& a : arg_nodes) res += eval(a,env).as_string();
             return Value::from_string(res);
         }
+        if (name == "random") {
+            if (arg_nodes.empty()) return Value::from_real((double)rand() / RAND_MAX);
+            long long n = eval(arg_nodes[0], env).as_int();
+            return Value::from_int(n > 0 ? rand() % n : 0);
+        }
+        if (name == "randomize") { srand((unsigned)time(nullptr)); return Value{}; }
         if (name == "sin")  return Value::from_real(std::sin(eval(arg_nodes[0],env).as_real()));
         if (name == "cos")  return Value::from_real(std::cos(eval(arg_nodes[0],env).as_real()));
         if (name == "exp")  return Value::from_real(std::exp(eval(arg_nodes[0],env).as_real()));
@@ -948,6 +962,13 @@ class Interpreter {
                 catch (...) { env->set(lo, Value::from_real(std::stod(s))); }
             }
             return Value{};
+        }
+
+        // ── Graphics built-ins (SDL2, optional) ──
+        {
+            auto [handled, gval] = evalGraphCall(name, arg_nodes,
+                [&](const ASTPtr& n) { return eval(n, env); });
+            if (handled) return gval;
         }
 
         // ── User-defined procedure/function ──

@@ -53,7 +53,7 @@ enum class TokenType {
     // Keywords
     PROGRAM, VAR, CONST, BEGIN, END, IF, THEN, ELSE,
     WHILE, DO, FOR, TO, DOWNTO, REPEAT, UNTIL,
-    PROCEDURE, FUNCTION, ARRAY, OF, RECORD, TYPE,
+    PROCEDURE, FUNCTION, ARRAY, OF, RECORD, TYPE, OBJECT,
     DIV, MOD, AND, OR, NOT, XOR,
     TRUE, FALSE,
     INTEGER, REAL, BOOLEAN, STRING, CHAR,
@@ -83,6 +83,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"until",     TokenType::UNTIL},     {"procedure", TokenType::PROCEDURE},
     {"function",  TokenType::FUNCTION},  {"array",     TokenType::ARRAY},
     {"of",        TokenType::OF},        {"record",    TokenType::RECORD},  {"type",      TokenType::TYPE},
+    {"object",    TokenType::OBJECT},
     {"div",       TokenType::DIV},       {"mod",       TokenType::MOD},
     {"and",       TokenType::AND},       {"or",        TokenType::OR},
     {"not",       TokenType::NOT},       {"xor",       TokenType::XOR},
@@ -285,9 +286,52 @@ struct VarDecl : ASTNode {
 
 struct ConstDecl : ASTNode { std::string name; ASTPtr value; };
 struct FieldAccessNode : ASTNode { ASTPtr record; std::string field; };
+struct MethodCallNode  : ASTNode {
+    ASTPtr object;
+    std::string method;
+    std::vector<ASTPtr> args;
+    std::string typeName;
+};
 
-// Maps type name (lower) -> list of (fieldName, typeName) pairs
-static std::unordered_map<std::string, std::vector<std::pair<std::string,std::string>>> g_recordTypes;
+// Object/record type definition
+struct ObjTypeDef {
+    std::string parent;  // lower-case parent type name, or ""
+    std::vector<std::pair<std::string,std::string>> fields; // (name, type)
+    std::unordered_map<std::string, std::shared_ptr<struct ProcDef>> methods;
+};
+static std::unordered_map<std::string, ObjTypeDef> g_recordTypes;
+
+// Helper: get all fields including inherited ones
+static std::vector<std::pair<std::string,std::string>> getAllFields(const std::string& typeName) {
+    std::vector<std::pair<std::string,std::string>> result;
+    std::string cur = typeName;
+    std::vector<std::string> chain;
+    while (!cur.empty()) {
+        auto it = g_recordTypes.find(cur);
+        if (it == g_recordTypes.end()) break;
+        chain.push_back(cur);
+        cur = it->second.parent;
+    }
+    // Emit parent fields first
+    std::reverse(chain.begin(), chain.end());
+    for (auto& t : chain)
+        for (auto& f : g_recordTypes[t].fields)
+            result.push_back(f);
+    return result;
+}
+
+// Helper: find a method in type or any ancestor
+static std::shared_ptr<ProcDef> findMethod(const std::string& typeName, const std::string& methodName) {
+    std::string cur = typeName;
+    while (!cur.empty()) {
+        auto it = g_recordTypes.find(cur);
+        if (it == g_recordTypes.end()) break;
+        auto mit = it->second.methods.find(methodName);
+        if (mit != it->second.methods.end()) return mit->second;
+        cur = it->second.parent;
+    }
+    return nullptr;
+}
 
 
 // ─────────────────────────────────────────────
@@ -357,12 +401,55 @@ private:
                     std::string typeName = consume().value;
                     std::transform(typeName.begin(), typeName.end(), typeName.begin(), ::tolower);
                     expect(TokenType::EQ);
-                    if (check(TokenType::RECORD)) {
-                        consume(); // eat 'record'
+                    if (check(TokenType::RECORD) || check(TokenType::OBJECT)) {
+                        bool isObj = check(TokenType::OBJECT);
+                        consume(); // eat 'record' or 'object'
+                        // Check for parent type: object(TParent)
+                        std::string parent;
+                        if (isObj && match(TokenType::LPAREN)) {
+                            parent = consume().value;
+                            std::transform(parent.begin(), parent.end(), parent.begin(), ::tolower);
+                            expect(TokenType::RPAREN);
+                        }
+                        // Parse fields and method declarations
                         auto fields = parseRecordFields();
+                        // Parse method declarations (procedure/function headers only)
+                        while (check(TokenType::PROCEDURE) || check(TokenType::FUNCTION)) {
+                            bool isFn = check(TokenType::FUNCTION);
+                            consume();
+                            std::string mname = expect(TokenType::IDENTIFIER).value;
+                            std::transform(mname.begin(), mname.end(), mname.begin(), ::tolower);
+                            auto pd = std::make_shared<ProcDef>();
+                            pd->name = mname;
+                            pd->is_function = isFn;
+                            if (match(TokenType::LPAREN)) {
+                                while (!check(TokenType::RPAREN)) {
+                                    bool isVar = false;
+                                    if (peek().type == TokenType::VAR) { consume(); isVar=true; }
+                                    std::vector<std::string> pnames;
+                                    pnames.push_back(expect(TokenType::IDENTIFIER).value);
+                                    while (match(TokenType::COMMA))
+                                        pnames.push_back(expect(TokenType::IDENTIFIER).value);
+                                    expect(TokenType::COLON);
+                                    std::string ptype = consume().value;
+                                    for (auto& n : pnames)
+                                        pd->params.push_back({n, ptype, isVar});
+                                    if (!match(TokenType::SEMICOLON)) break;
+                                }
+                                expect(TokenType::RPAREN);
+                            }
+                            if (isFn) {
+                                expect(TokenType::COLON);
+                                pd->return_type = consume().value;
+                            }
+                            match(TokenType::SEMICOLON);
+                            // Store as forward declaration — body parsed elsewhere
+                            g_recordTypes[typeName].methods[mname] = pd;
+                        }
                         expect(TokenType::END);
                         match(TokenType::SEMICOLON);
-                        g_recordTypes[typeName] = fields;
+                        g_recordTypes[typeName].fields = fields;
+                        g_recordTypes[typeName].parent = parent;
                     } else {
                         // type alias — skip for now
                         consume();
@@ -393,7 +480,7 @@ private:
                 // so the interpreter can create instances
                 static int anonCount = 0;
                 std::string anonName = "__anon_record_" + std::to_string(anonCount++) + "__";
-                g_recordTypes[anonName] = vd->record_fields;
+                g_recordTypes[anonName].fields = vd->record_fields;
                 vd->type_name = anonName;
                 match(TokenType::SEMICOLON);
             } else if (match(TokenType::ARRAY)) {
@@ -414,7 +501,7 @@ private:
                 std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
                 if (g_recordTypes.count(lo)) {
                     vd->is_record = true;
-                    vd->record_fields = g_recordTypes[lo];
+                    vd->record_fields = getAllFields(lo);
                 }
                 expect(TokenType::SEMICOLON);
             }
@@ -439,6 +526,13 @@ private:
         auto pd = std::make_shared<ProcDef>();
         pd->is_function = is_func;
         pd->name = expect(TokenType::IDENTIFIER).value;
+        // Method implementation: procedure TAnimal.init
+        if (check(TokenType::DOT) && peek(1).type == TokenType::IDENTIFIER) {
+            consume(); // eat '.'
+            std::string methodName = consume().value;
+            // Store as "TypeName.MethodName" so interpreter can register it
+            pd->name = pd->name + "." + methodName;
+        }
         // params
         if (match(TokenType::LPAREN)) {
             while (!check(TokenType::RPAREN)) {
@@ -600,14 +694,31 @@ private:
             return assign;
         }
 
-        // Not an assignment — must be a procedure call (target must be plain VarNode)
-        // Rewind: we built up a target but it's actually a call
+        // Method call: obj.method(args) or obj.method
+        if (auto* fa = dynamic_cast<FieldAccessNode*>(target.get())) {
+            auto mc = std::make_shared<MethodCallNode>();
+            mc->object = fa->record;
+            mc->method = fa->field;
+            std::transform(mc->method.begin(), mc->method.end(), mc->method.begin(), ::tolower);
+            if (match(TokenType::LPAREN)) {
+                if (!check(TokenType::RPAREN)) {
+                    mc->args.push_back(parseExpr());
+                    while (match(TokenType::COMMA)) mc->args.push_back(parseExpr());
+                }
+                expect(TokenType::RPAREN);
+            }
+            return mc;
+        }
+
+        // Plain procedure/function call
         auto* vn = dynamic_cast<VarNode*>(target.get());
         auto call = std::make_shared<CallNode>();
         call->name = vn ? vn->name : name;
         if (match(TokenType::LPAREN)) {
-            call->args.push_back(parseExpr());
-            while (match(TokenType::COMMA)) call->args.push_back(parseExpr());
+            if (!check(TokenType::RPAREN)) {
+                call->args.push_back(parseExpr());
+                while (match(TokenType::COMMA)) call->args.push_back(parseExpr());
+            }
             expect(TokenType::RPAREN);
         }
         return call;
@@ -743,10 +854,25 @@ private:
                 while (check(TokenType::DOT) && peek(1).type == TokenType::IDENTIFIER) {
                     consume(); // eat '.'
                     std::string fieldName = expect(TokenType::IDENTIFIER).value;
-                    auto fa = std::make_shared<FieldAccessNode>();
-                    fa->record = result;
-                    fa->field  = fieldName;
-                    result = fa;
+                    // If followed by '(' it's a method call expression
+                    if (check(TokenType::LPAREN)) {
+                        auto mc = std::make_shared<MethodCallNode>();
+                        mc->object = result;
+                        mc->method = fieldName;
+                        std::transform(mc->method.begin(), mc->method.end(), mc->method.begin(), ::tolower);
+                        consume(); // eat '('
+                        if (!check(TokenType::RPAREN)) {
+                            mc->args.push_back(parseExpr());
+                            while (match(TokenType::COMMA)) mc->args.push_back(parseExpr());
+                        }
+                        expect(TokenType::RPAREN);
+                        result = mc;
+                    } else {
+                        auto fa = std::make_shared<FieldAccessNode>();
+                        fa->record = result;
+                        fa->field  = fieldName;
+                        result = fa;
+                    }
                 }
                 return result;
             }
@@ -864,6 +990,7 @@ struct ReturnException { Value val; };
 class Interpreter {
     std::unordered_map<std::string, std::shared_ptr<ProcDef>> procs;
     std::shared_ptr<Environment> global_env;
+    std::vector<std::pair<Value*, std::string>> selfStack; // current object during method execution
 
     // Evaluate an expression
     Value eval(const ASTPtr& node, std::shared_ptr<Environment> env) {
@@ -876,6 +1003,12 @@ class Interpreter {
         if (auto* n = dynamic_cast<StringNode*>(node.get())) return Value::from_string(n->value);
         if (auto* n = dynamic_cast<CharNode*>(node.get()))   return Value::from_char(n->value);
 
+        if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
+            return evalMethodCall(n, env);
+        }
+        if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
+            return evalMethodCall(n, env);
+        }
         if (auto* n = dynamic_cast<FieldAccessNode*>(node.get())) {
             Value rec = eval(n->record, env);
             if (rec.vtype != Value::Type::RECORD || !rec.fields)
@@ -883,9 +1016,14 @@ class Interpreter {
             std::string flo = n->field;
             std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
             auto it = rec.fields->find(flo);
-            if (it == rec.fields->end())
-                throw std::runtime_error("Unknown record field: " + n->field);
-            return it->second;
+            if (it != rec.fields->end()) return it->second;
+            // Not a field — try as zero-arg method call
+            std::string tn2 = getObjTypeName(rec);
+            if (!tn2.empty() && findMethod(tn2, flo)) {
+                MethodCallNode mc2; mc2.object = n->record; mc2.method = flo;
+                return evalMethodCall(&mc2, env);
+            }
+            throw std::runtime_error("Unknown record field: " + n->field);
         }
         if (auto* n = dynamic_cast<VarNode*>(node.get())) {
             std::string lo = n->name;
@@ -896,6 +1034,24 @@ class Interpreter {
                 auto [handled, gval] = evalGraphCall(lo, {},
                     [&](const ASTPtr& n2) { return eval(n2, env); });
                 if (handled) return gval;
+            }
+            // Inside a method: try env first (has up-to-date copies of self fields)
+            // then fall back to selfStack for fields not yet in env
+            if (!selfStack.empty()) {
+                // Try normal env lookup first (call_env has copies of self fields)
+                try { return env->get(lo); } catch (...) {}
+                // Not in env — check selfPtr fields and zero-arg methods
+                auto& [selfPtr, selfType] = selfStack.back();
+                if (selfPtr && selfPtr->fields && lo != "__type__") {
+                    auto fit = selfPtr->fields->find(lo);
+                    if (fit != selfPtr->fields->end()) return fit->second;
+                }
+                std::string fullName = selfType + "." + lo;
+                if (procs.count(fullName)) {
+                    auto pd2 = findMethod(selfType, lo);
+                    if (pd2 && pd2->is_function) return evalCall(fullName, {}, env);
+                }
+                throw std::runtime_error("Undefined variable: " + lo);
             }
             return env->get(lo);
         }
@@ -1006,6 +1162,89 @@ class Interpreter {
         throw std::runtime_error("Unknown operator: " + op);
     }
 
+    // Get the type name stored in an object's fields map
+
+    // Evaluate a method call: obj.method(args)
+    // The object is passed by reference so field assignments persist
+
+    // Execute MethodCallNode as a statement
+    void execMethodCall(const MethodCallNode* n, std::shared_ptr<Environment> env) {
+        evalMethodCall(n, env);
+    }
+
+    std::string getObjTypeName(const Value& obj) {
+        if (obj.vtype != Value::Type::RECORD || !obj.fields) return "";
+        auto it = obj.fields->find("__type__");
+        return (it != obj.fields->end()) ? it->second.sval : "";
+    }
+
+    Value evalMethodCall(const MethodCallNode* n, std::shared_ptr<Environment> env) {
+        Value objVal = eval(n->object, env);
+        std::string typeName = getObjTypeName(objVal);
+        if (typeName.empty()) throw std::runtime_error("Cannot call method on non-object");
+
+        auto pd = findMethod(typeName, n->method);
+        if (!pd) throw std::runtime_error("Unknown method: " + typeName + "." + n->method);
+
+        // Find root variable for write-back
+        std::function<std::string(const ASTNode*)> getRootName = [&](const ASTNode* node) -> std::string {
+            if (auto* vn = dynamic_cast<const VarNode*>(node)) {
+                std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower); return lo;
+            }
+            if (auto* fa = dynamic_cast<const FieldAccessNode*>(node)) return getRootName(fa->record.get());
+            if (auto* mc = dynamic_cast<const MethodCallNode*>(node)) return getRootName(mc->object.get());
+            return "";
+        };
+        std::string rootName = getRootName(n->object.get());
+
+        auto call_env = std::make_shared<Environment>(global_env);
+        // Copy all self fields into call env
+        for (auto& [fn, fv] : *objVal.fields)
+            call_env->set_local(fn, fv);
+        // Copy fields from parent types too (already in objVal if initialized correctly)
+
+        // Bind parameters
+        for (size_t i = 0; i < pd->params.size() && i < n->args.size(); i++) {
+            std::string pn = pd->params[i].name;
+            std::transform(pn.begin(), pn.end(), pn.begin(), ::tolower);
+            call_env->set_local(pn, eval(n->args[i], env));
+        }
+
+        // Return variable for functions (use short method name)
+        std::string rname;
+        if (pd->is_function) {
+            rname = pd->name;
+            std::transform(rname.begin(), rname.end(), rname.begin(), ::tolower);
+            call_env->set_local(rname, Value{});
+        }
+
+        // Process local variable declarations
+        processDeclarations(pd->decls, call_env);
+
+        // Get selfPtr for write-back
+        Value* selfPtr = nullptr;
+        if (!rootName.empty()) {
+            try { selfPtr = &env->get_ref(rootName); } catch (...) {}
+        }
+        selfStack.push_back({selfPtr, typeName});
+
+        try { exec(pd->body, call_env); } catch (ReturnException&) {}
+
+        selfStack.pop_back();
+
+        // Write back modified fields
+        if (selfPtr && selfPtr->fields) {
+            for (auto& [fn, fv] : *selfPtr->fields) {
+                if (fn == "__type__") continue;
+                auto it2 = call_env->vars.find(fn);
+                if (it2 != call_env->vars.end()) fv = it2->second;
+            }
+        }
+
+        if (pd->is_function) return call_env->get(rname);
+        return Value{};
+    }
+
     Value evalCall(const std::string& raw_name, const std::vector<ASTPtr>& arg_nodes,
                    std::shared_ptr<Environment> env) {
         std::string name = raw_name;
@@ -1102,8 +1341,48 @@ class Interpreter {
 
         // ── User-defined procedure/function ──
         auto it = procs.find(name);
-        if (it == procs.end())
+        if (it == procs.end()) {
+            // Inside a method — try as self method call
+            if (!selfStack.empty()) {
+                auto& [selfPtr2, selfType2] = selfStack.back();
+                auto pd2 = findMethod(selfType2, name);
+                if (pd2) {
+                    std::string fullName2 = selfType2 + "." + name;
+                    auto it2 = procs.find(fullName2);
+                    if (it2 != procs.end()) {
+                        // Build a fake MethodCallNode and dispatch
+                        auto call_env2 = std::make_shared<Environment>(global_env);
+                        if (selfPtr2 && selfPtr2->fields)
+                            for (auto& [fn, fv] : *selfPtr2->fields)
+                                call_env2->set_local(fn, fv);
+                        for (size_t i = 0; i < pd2->params.size() && i < arg_nodes.size(); i++) {
+                            std::string pn = pd2->params[i].name;
+                            std::transform(pn.begin(), pn.end(), pn.begin(), ::tolower);
+                            call_env2->set_local(pn, eval(arg_nodes[i], env));
+                        }
+                        std::string rname3;
+                        if (pd2->is_function) {
+                            rname3 = pd2->name;
+                            std::transform(rname3.begin(), rname3.end(), rname3.begin(), ::tolower);
+                            call_env2->set_local(rname3, Value{});
+                        }
+                        processDeclarations(pd2->decls, call_env2);
+                        selfStack.push_back({selfPtr2, selfType2});
+                        try { exec(pd2->body, call_env2); } catch (ReturnException&) {}
+                        selfStack.pop_back();
+                        if (selfPtr2 && selfPtr2->fields)
+                            for (auto& [fn, fv] : *selfPtr2->fields) {
+                                if (fn == "__type__") continue;
+                                auto fit2 = call_env2->vars.find(fn);
+                                if (fit2 != call_env2->vars.end()) fv = fit2->second;
+                            }
+                        if (pd2->is_function) return call_env2->get(rname3);
+                        return Value{};
+                    }
+                }
+            }
             throw std::runtime_error("Undefined procedure/function: " + name);
+        }
 
         auto& pd = it->second;
         auto call_env = std::make_shared<Environment>(global_env);
@@ -1116,9 +1395,11 @@ class Interpreter {
             call_env->set_local(pname, arg_val);
         }
 
-        // result variable for functions
+        // result variable for functions (strip type prefix for methods)
         if (pd->is_function) {
             std::string rname = name;
+            auto rdot = rname.find('.');
+            if (rdot != std::string::npos) rname = rname.substr(rdot + 1);
             call_env->set_local(rname, Value{});
         }
 
@@ -1130,7 +1411,10 @@ class Interpreter {
         } catch (ReturnException&) {}
 
         if (pd->is_function) {
-            return call_env->get(name);
+            std::string rname2 = name;
+            auto rdot2 = rname2.find('.');
+            if (rdot2 != std::string::npos) rname2 = rname2.substr(rdot2 + 1);
+            return call_env->get(rname2);
         }
 
         // propagate var (by-ref) parameters back
@@ -1265,6 +1549,14 @@ class Interpreter {
             }
             return;
         }
+        if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
+            execMethodCall(n, env);
+            return;
+        }
+        if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
+            evalMethodCall(n, env);
+            return;
+        }
         if (auto* n = dynamic_cast<CallNode*>(node.get())) {
             evalCall(n->name, n->args, env);
             return;
@@ -1279,18 +1571,21 @@ class Interpreter {
                     std::string lo = nm; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
                     if (vd->is_record) {
                         Value rec = Value::make_record();
+                        // Store type name so methods can be found
+                        std::string tlo = vd->type_name;
+                        std::transform(tlo.begin(), tlo.end(), tlo.begin(), ::tolower);
+                        (*rec.fields)["__type__"] = Value::from_string(tlo);
                         for (auto& [fn, ft] : vd->record_fields) {
                             std::string flo = fn;
                             std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
-                            // initialise each field to a default value based on type
-                            std::string tlo = ft;
-                            std::transform(tlo.begin(), tlo.end(), tlo.begin(), ::tolower);
+                            std::string ftlo = ft;
+                            std::transform(ftlo.begin(), ftlo.end(), ftlo.begin(), ::tolower);
                             Value fv;
-                            if (tlo=="integer"||tlo=="longint"||tlo=="word"||tlo=="byte") fv=Value::from_int(0);
-                            else if (tlo=="real"||tlo=="double"||tlo=="single") fv=Value::from_real(0.0);
-                            else if (tlo=="boolean") fv=Value::from_bool(false);
-                            else if (tlo=="char")    fv=Value::from_char('\0');
-                            else if (tlo=="string")  fv=Value::from_string("");
+                            if (ftlo=="integer"||ftlo=="longint"||ftlo=="word"||ftlo=="byte") fv=Value::from_int(0);
+                            else if (ftlo=="real"||ftlo=="double"||ftlo=="single") fv=Value::from_real(0.0);
+                            else if (ftlo=="boolean") fv=Value::from_bool(false);
+                            else if (ftlo=="char")    fv=Value::from_char('\0');
+                            else if (ftlo=="string")  fv=Value::from_string("");
                             (*rec.fields)[flo] = fv;
                         }
                         env->set_local(lo, rec);
@@ -1312,8 +1607,21 @@ class Interpreter {
                 std::string lo = cd->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
                 env->set_local(lo, eval(cd->value, env));
             } else if (auto* pd = dynamic_cast<ProcDef*>(d.get())) {
-                std::string lo = pd->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
-                procs[lo] = std::make_shared<ProcDef>(*pd);
+                std::string lo = pd->name;
+                std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                auto dot = lo.find('.');
+                if (dot != std::string::npos) {
+                    // Method implementation: "typename.methodname"
+                    std::string typeName   = lo.substr(0, dot);
+                    std::string methodName = lo.substr(dot + 1);
+                    auto shpd = std::make_shared<ProcDef>(*pd);
+                    shpd->name = methodName;
+                    g_recordTypes[typeName].methods[methodName] = shpd;
+                    // Also store under full name for backward compat
+                    procs[lo] = shpd;
+                } else {
+                    procs[lo] = std::make_shared<ProcDef>(*pd);
+                }
             }
         }
     }
@@ -1416,7 +1724,8 @@ class Compiler {
     std::ostringstream out;   // generated C source
     int indent = 0;
     int tmpCount = 0;
-    std::string currentFunc; // name of function being compiled (for return var)
+    std::string currentFunc;       // name of function being compiled (for return var)
+    std::string currentMethodType; // type name when inside a method body, else ""
     std::set<std::string> userProcs; // user-defined proc/func names (lower-case)
     std::map<std::string, std::string> varTypes; // varname(lower) -> pascal type
 
@@ -1458,6 +1767,63 @@ class Compiler {
 
     // ── Expression codegen ────────────────────
 
+    bool isStrExpr(const ASTPtr& node) {
+        if (!node) return false;
+        if (dynamic_cast<StringNode*>(node.get())) return true;
+        if (auto* vn = dynamic_cast<VarNode*>(node.get())) {
+            std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+            auto it = varTypes.find(lo);
+            if (it == varTypes.end()) it = varTypes.find("self."+lo);
+            if (it != varTypes.end()) { std::string t=it->second; std::transform(t.begin(),t.end(),t.begin(),::tolower); return t=="string"; }
+        }
+        if (auto* fa = dynamic_cast<FieldAccessNode*>(node.get())) {
+            std::string ft = getFieldType(fa); std::transform(ft.begin(),ft.end(),ft.begin(),::tolower);
+            return ft == "string";
+        }
+        if (auto* bn = dynamic_cast<BinOpNode*>(node.get())) return bn->op=="+" && (isStrExpr(bn->left)||isStrExpr(bn->right));
+        return false;
+    }
+
+    // Get the object type name from an expression (for method dispatch)
+    std::string getExprTypeName(const ASTPtr& node) {
+        if (auto* vn = dynamic_cast<VarNode*>(node.get())) {
+            std::string lo = vn->name;
+            std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            auto it = varTypes.find(lo);
+            if (it != varTypes.end()) return it->second;
+        }
+        return "";
+    }
+
+    std::string genMethodCall(const MethodCallNode* n) {
+        // Emit: pas_DefiningTypeName_methodname((struct pas_rec_DefType*)&obj, args...)
+        std::string typeName = getExprTypeName(n->object);
+        std::transform(typeName.begin(), typeName.end(), typeName.begin(), ::tolower);
+        // Walk parent chain to find where method is defined
+        std::string definingType = typeName;
+        {
+            std::string cur = typeName;
+            while (!cur.empty()) {
+                auto it = g_recordTypes.find(cur);
+                if (it == g_recordTypes.end()) break;
+                if (it->second.methods.count(n->method)) { definingType = cur; break; }
+                cur = it->second.parent;
+            }
+        }
+        std::string objExpr = genExpr(n->object);
+        std::string fnName = "pas_" + definingType + "_" + n->method;
+        // Cast to parent struct pointer if needed (for inherited methods)
+        std::string selfArg;
+        if (definingType != typeName)
+            selfArg = "(struct pas_rec_" + definingType + "*)&" + objExpr;
+        else
+            selfArg = "&" + objExpr;
+        std::string call = fnName + "(" + selfArg;
+        for (auto& arg : n->args) call += ", " + genExpr(arg);
+        call += ")";
+        return call;
+    }
+
     // Get the Pascal type name of a field access expression
     std::string getFieldType(const FieldAccessNode* fa) const {
         // Walk to the root VarNode to get the record type
@@ -1484,7 +1850,7 @@ class Compiler {
             auto git = g_recordTypes.find(typeName);
             if (git == g_recordTypes.end()) return "";
             bool found = false;
-            for (auto& [fn, ft] : git->second) {
+            for (auto& [fn, ft] : git->second.fields) {
                 std::string flo2 = fn;
                 std::transform(flo2.begin(), flo2.end(), flo2.begin(), ::tolower);
                 if (flo2 == fields[i]) {
@@ -1575,11 +1941,23 @@ class Compiler {
             }
             return "\"" + escaped + "\"";
         }
+        if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
+            return genMethodCall(n);
+        }
         if (auto* n = dynamic_cast<FieldAccessNode*>(node.get())) {
-            // Build: safeId(root).field1.field2...
-            std::string expr = genExpr(n->record);
             std::string flo = n->field;
             std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+            // Check if this is actually a zero-arg method call
+            std::string objType = getExprTypeName(n->record);
+            std::transform(objType.begin(), objType.end(), objType.begin(), ::tolower);
+            if (!objType.empty() && findMethod(objType, flo)) {
+                MethodCallNode mc;
+                mc.object = n->record;
+                mc.method = flo;
+                return genMethodCall(&mc);
+            }
+            // Regular field access
+            std::string expr = genExpr(n->record);
             return expr + ".pas_" + flo;
         }
         if (auto* n = dynamic_cast<VarNode*>(node.get())) {
@@ -1588,9 +1966,51 @@ class Compiler {
             if (!currentFunc.empty()) {
                 std::string cf = currentFunc;
                 std::transform(cf.begin(), cf.end(), cf.begin(), ::tolower);
-                if (lo == cf) return "_ret_";
+                auto dot = cf.find('.');
+                std::string shortCf = (dot != std::string::npos) ? cf.substr(dot+1) : cf;
+                if (lo == cf || lo == shortCf) return "_ret_";
             }
-            // Zero-argument graphics functions arrive as VarNodes — emit as calls
+            // Self field inside a method
+            if (!currentMethodType.empty() && varTypes.count("self." + lo) && !varTypes.count(lo))
+                return "self->pas_" + lo;
+            // Zero-arg self method inside a method body (bare name, no parens)
+            if (!currentMethodType.empty() && !varTypes.count(lo) && !varTypes.count("self."+lo)) {
+                auto pd3 = findMethod(currentMethodType, lo);
+                if (pd3 && pd3->is_function) {
+                    // Find defining type (for inheritance)
+                    std::string defType = currentMethodType;
+                    for (std::string cur3 = currentMethodType; !cur3.empty(); ) {
+                        auto it5 = g_recordTypes.find(cur3);
+                        if (it5 == g_recordTypes.end()) break;
+                        if (it5->second.methods.count(lo)) { defType = cur3; break; }
+                        cur3 = it5->second.parent;
+                    }
+                    // Use virtual dispatch if any child type overrides this method
+                    // with same signature
+                    bool hasOverride = false;
+                    for (auto& [tn, td] : g_recordTypes) {
+                        if (tn == defType) continue;
+                        std::string anc = td.parent;
+                        while (!anc.empty()) {
+                            if (anc == defType) {
+                                auto mit2 = td.methods.find(lo);
+                                if (mit2 != td.methods.end() &&
+                                    mit2->second->params.size() == pd3->params.size())
+                                    hasOverride = true;
+                                break;
+                            }
+                            auto ait = g_recordTypes.find(anc);
+                            if (ait == g_recordTypes.end()) break;
+                            anc = ait->second.parent;
+                        }
+                        if (hasOverride) break;
+                    }
+                    if (hasOverride)
+                        return "pas_" + defType + "_" + lo + "__virt(self)";
+                    return "pas_" + defType + "_" + lo + "(self)";
+                }
+            }
+            // Zero-argument graphics functions arrive as VarNodes
             static const std::set<std::string> zeroArgGfx = {
                 "graphresult","getmaxx","getmaxy","getx","gety",
                 "getcolor","getbkcolor","readkey"
@@ -1611,6 +2031,29 @@ class Compiler {
             if (n->op == "not") return "(!(" + genExpr(n->operand) + "))";
         }
         if (auto* n = dynamic_cast<BinOpNode*>(node.get())) {
+            // String concatenation: collect all + operands and emit pas_concat_str
+            if (n->op == "+") {
+                bool lStr = isStrExpr(n->left), rStr = isStrExpr(n->right);
+                if (lStr || rStr) {
+                    std::vector<std::string> parts;
+                    std::function<void(const ASTPtr&)> collect = [&](const ASTPtr& nd) {
+                        if (auto* b = dynamic_cast<BinOpNode*>(nd.get()); b && b->op == "+")
+                            { collect(b->left); collect(b->right); }
+                        else {
+                            // Wrap char literals in a string
+                            if (dynamic_cast<CharNode*>(nd.get())) {
+                                // genExpr returns '\\x' — wrap in (char[]){x, 0}
+                                std::string ce = genExpr(nd);
+                                parts.push_back("(char[]){" + ce + ", 0}");
+                            } else parts.push_back(genExpr(nd));
+                        }
+                    };
+                    collect(n->left); collect(n->right);
+                    std::string call = "pas_concat_str(" + std::to_string(parts.size());
+                    for (auto& p : parts) call += ", " + p;
+                    return call + ")";
+                }
+            }
             std::string l = genExpr(n->left), r = genExpr(n->right);
             if (n->op == "+")   return "(" + l + " + "  + r + ")";
             if (n->op == "-")   return "(" + l + " - "  + r + ")";
@@ -1798,8 +2241,56 @@ class Compiler {
                 std::transform(vlo.begin(), vlo.end(), vlo.begin(), ::tolower);
                 std::string cf = currentFunc;
                 std::transform(cf.begin(), cf.end(), cf.begin(), ::tolower);
-                std::string lhs = (!currentFunc.empty() && vlo == cf) ? "_ret_" : safeId(vn->name);
-                emitind(lhs + " = " + genExpr(n->value) + ";");
+                std::string lhs;
+                // Compute short function name (strip type prefix for methods)
+                std::string lhsCf = currentFunc;
+                std::transform(lhsCf.begin(), lhsCf.end(), lhsCf.begin(), ::tolower);
+                auto cfDot = lhsCf.find('.');
+                std::string lhsShortCf = (cfDot != std::string::npos) ? lhsCf.substr(cfDot+1) : lhsCf;
+                if (!currentFunc.empty() && (vlo == lhsCf || vlo == lhsShortCf))
+                    lhs = "_ret_";
+                else if (!currentMethodType.empty() && varTypes.count("self." + vlo) && !varTypes.count(vlo) && vlo != lhsShortCf)
+                    lhs = "self->pas_" + vlo;  // field assignment in method
+                else
+                    lhs = safeId(vn->name);
+                // String assignments need strncpy
+                std::string rhsExpr = genExpr(n->value);
+                bool rhsIsStr = dynamic_cast<StringNode*>(n->value.get()) != nullptr;
+                if (!rhsIsStr) {
+                    // Check if rhs is a string type variable or field
+                    auto checkStrType = [&](const std::string& t) {
+                        std::string tl = t; std::transform(tl.begin(),tl.end(),tl.begin(),::tolower);
+                        return tl == "string";
+                    };
+                    if (auto* vn2 = dynamic_cast<VarNode*>(n->value.get())) {
+                        std::string rlo = vn2->name; std::transform(rlo.begin(),rlo.end(),rlo.begin(),::tolower);
+                        if (varTypes.count(rlo) && checkStrType(varTypes[rlo])) rhsIsStr = true;
+                        else if (varTypes.count("self."+rlo) && checkStrType(varTypes["self."+rlo])) rhsIsStr = true;
+                    }
+                    if (auto* fa = dynamic_cast<FieldAccessNode*>(n->value.get())) {
+                        if (checkStrType(getFieldType(fa))) rhsIsStr = true;
+                    }
+                }
+                bool lhsIsStr = false;
+                if (lhs == "_ret_") {
+                    // Check function return type
+                    auto it2 = varTypes.find(lhsCf + "__ret");
+                    if (it2 != varTypes.end()) {
+                        std::string t = it2->second; std::transform(t.begin(),t.end(),t.begin(),::tolower);
+                        lhsIsStr = (t == "string");
+                    }
+                } else if (!currentMethodType.empty() && varTypes.count("self."+vlo)) {
+                    std::string t = varTypes["self."+vlo]; std::transform(t.begin(),t.end(),t.begin(),::tolower);
+                    lhsIsStr = (t == "string");
+                } else if (varTypes.count(vlo)) {
+                    std::string t = varTypes[vlo]; std::transform(t.begin(),t.end(),t.begin(),::tolower);
+                    lhsIsStr = (t == "string");
+                }
+                if (lhsIsStr || rhsIsStr)
+                    emitind("strncpy(" + lhs + ", " + rhsExpr + ", 1023);");
+                else
+                    emitind(lhs + " = " + rhsExpr + ";");
+                return;
             }
             return;
         }
@@ -1869,31 +2360,81 @@ class Compiler {
                     else
                         emitind("pas_print_d((double)(" + e + "));");
                 } else if (auto* fa = dynamic_cast<FieldAccessNode*>(arg.get())) {
-                    // Record field — look up field type
+                    // Record field or zero-arg method call
                     std::string ftype = getFieldType(fa);
-                    if (ftype == "real" || ftype == "double" || ftype == "single")
-                        emitind("pas_print_d((double)(" + e + "));");
-                    else if (ftype == "char")
-                        emitind("pas_print_c((char)(" + e + "));");
-                    else if (ftype == "string")
-                        emitind("pas_print_s(" + e + ");");
-                    else
-                        emitind("pas_print_ll((long long)(" + e + "));");
+                    if (ftype.empty()) {
+                        // Not a field — might be a zero-arg method call
+                        std::string objType = getExprTypeName(fa->record);
+                        std::transform(objType.begin(), objType.end(), objType.begin(), ::tolower);
+                        std::string mlo = fa->field;
+                        std::transform(mlo.begin(), mlo.end(), mlo.begin(), ::tolower);
+                        auto pd2 = findMethod(objType, mlo);
+                        if (pd2 && pd2->is_function) {
+                            std::string rt = pd2->return_type;
+                            std::transform(rt.begin(), rt.end(), rt.begin(), ::tolower);
+                            if (rt == "real" || rt == "double" || rt == "single")
+                                emitind("pas_print_d((double)(" + e + "));");
+                            else if (rt == "string")
+                                emitind("pas_print_s(" + e + ");");
+                            else if (rt == "char")
+                                emitind("pas_print_c((char)(" + e + "));");
+                            else
+                                emitind("pas_print_ll((long long)(" + e + "));");
+                        } else {
+                            emitind("PAS_PRINT(" + e + ");");
+                        }
+                    } else {
+                        std::transform(ftype.begin(), ftype.end(), ftype.begin(), ::tolower);
+                        if (ftype == "real" || ftype == "double" || ftype == "single")
+                            emitind("pas_print_d((double)(" + e + "));");
+                        else if (ftype == "char")
+                            emitind("pas_print_c((char)(" + e + "));");
+                        else if (ftype == "string")
+                            emitind("pas_print_s(" + e + ");");
+                        else
+                            emitind("pas_print_ll((long long)(" + e + "));");
+                    }
                 } else if (auto* vn = dynamic_cast<VarNode*>(arg.get())) {
-                    // Variable — look up type and use correct print function
+                    // Variable — look up type (also handle zero-arg self methods)
                     std::string lo = vn->name;
                     std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
                     auto it = varTypes.find(lo);
+                    if (it == varTypes.end() && !currentMethodType.empty())
+                        it = varTypes.find("self." + lo);
                     std::string vtype = (it != varTypes.end()) ? it->second : "";
+                    // If not a field, check if it's a zero-arg self method
+                    if (vtype.empty() && !currentMethodType.empty()) {
+                        auto pd3 = findMethod(currentMethodType, lo);
+                        if (pd3 && pd3->is_function) vtype = pd3->return_type;
+                    }
                     std::transform(vtype.begin(), vtype.end(), vtype.begin(), ::tolower);
                     if (vtype == "real" || vtype == "double" || vtype == "single")
                         emitind("pas_print_d((double)(" + e + "));");
                     else if (vtype == "char")
                         emitind("pas_print_c((char)(" + e + "));");
                     else if (vtype == "string")
-                        emitind("pas_print_s((char*)(" + e + "));");
+                        emitind("pas_print_s(" + e + ");");
                     else
                         emitind("pas_print_ll((long long)(" + e + "));");
+                } else if (auto* mc = dynamic_cast<MethodCallNode*>(arg.get())) {
+                    // Method call — look up return type
+                    std::string typeName = getExprTypeName(mc->object);
+                    std::transform(typeName.begin(), typeName.end(), typeName.begin(), ::tolower);
+                    auto pd2 = findMethod(typeName, mc->method);
+                    if (pd2 && pd2->is_function) {
+                        std::string rt = pd2->return_type;
+                        std::transform(rt.begin(), rt.end(), rt.begin(), ::tolower);
+                        if (rt == "real" || rt == "double" || rt == "single")
+                            emitind("pas_print_d((double)(" + e + "));");
+                        else if (rt == "string")
+                            emitind("pas_print_s(" + e + ");");
+                        else if (rt == "char")
+                            emitind("pas_print_c((char)(" + e + "));");
+                        else
+                            emitind("pas_print_ll((long long)(" + e + "));");
+                    } else {
+                        emitind("PAS_PRINT(" + e + ");");
+                    }
                 } else {
                     // BinOp, CallNode, or other expression
                     // Use isRealExpr to decide format
@@ -1927,6 +2468,10 @@ class Compiler {
             if (n->newline) emitind("{ char _nl[256]; fgets(_nl, sizeof(_nl), stdin); }");
             return;
         }
+        if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
+            emitind(genMethodCall(n) + ";");
+            return;
+        }
         if (auto* n = dynamic_cast<CallNode*>(node.get())) {
             std::string name = n->name;
             std::transform(name.begin(), name.end(), name.begin(), ::tolower);
@@ -1941,10 +2486,10 @@ class Compiler {
     // Emit a C struct definition for a record type (once per type name)
     void emitRecordStruct(const std::string& typeName,
                           const std::vector<std::pair<std::string,std::string>>& fields) {
-        // C structs cannot have initializers in member declarations
         std::string sname = "struct pas_rec_" + typeName;
         emitind(sname + " {");
         indent++;
+        emitind("char __type__[64];"); // runtime type tag for virtual dispatch
         for (auto& [fn, ft] : fields) {
             std::string ct = cType(ft);
             std::string fid = "pas_" + fn;
@@ -1959,6 +2504,8 @@ class Compiler {
     }
 
     std::set<std::string> emittedStructs; // avoid duplicate struct defs
+    std::set<std::string> globalVarNames;  // names of global variables
+    std::vector<std::pair<std::string,std::string>> globalObjVars; // (id, typeName)
 
     void genDecl(const ASTPtr& node, bool global) {
         if (auto* vd = dynamic_cast<VarDecl*>(node.get())) {
@@ -1966,6 +2513,7 @@ class Compiler {
                 std::string id = safeId(nm);
                 std::string lo = nm; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
                 varTypes[lo] = vd->type_name;
+                if (global) globalVarNames.insert(lo);
                 if (vd->is_record) {
                     // Emit the struct type if not already done
                     std::string tlo = vd->type_name;
@@ -1975,6 +2523,7 @@ class Compiler {
                         emitRecordStruct(tlo, vd->record_fields);
                     }
                     emitind("struct pas_rec_" + tlo + " " + id + " = {0};");
+                    if (global) globalObjVars.push_back({id, tlo});
                 } else if (vd->is_array) {
                     int sz = vd->array_hi - vd->array_lo + 1;
                     emitind(cType(vd->type_name) + " " + id + "[" + std::to_string(sz) + "];");
@@ -1997,11 +2546,29 @@ class Compiler {
         auto* pd = dynamic_cast<ProcDef*>(node.get());
         if (!pd) return;
         std::string ret = pd->is_function ? cType(pd->return_type) : "void";
-        std::string sig = ret + " " + safeId(pd->name) + "(";
+
+        // Handle method: dotted name
+        std::string procName = pd->name;
+        std::string methType;
+        {
+            std::string lo = procName;
+            std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            auto dot = lo.find('.');
+            if (dot != std::string::npos) {
+                methType  = lo.substr(0, dot);
+                procName  = lo.substr(0, dot) + "_" + lo.substr(dot+1);
+            } else {
+                procName = lo;  // lowercase non-method proc names
+            }
+        }
+        std::string sig = ret + " pas_" + procName + "(";
+        if (!methType.empty()) {
+            sig += "struct pas_rec_" + methType + "* self";
+            if (!pd->params.empty()) sig += ", ";
+        }
         for (size_t i = 0; i < pd->params.size(); i++) {
             if (i) sig += ", ";
             std::string ct = cType(pd->params[i].type);
-            if (ct == "char*") ct = "char*";
             if (pd->params[i].by_ref) ct += "*";
             sig += ct + " " + safeId(pd->params[i].name);
         }
@@ -2016,21 +2583,63 @@ class Compiler {
 
         std::string prevFunc = currentFunc;
         currentFunc = pd->is_function ? pd->name : "";
-        // Record parameter types and return type
+
+        // Save globals that params might shadow, clear non-global/non-self varTypes
+        std::map<std::string,std::string> savedGlobals;
+        for (auto it6 = varTypes.begin(); it6 != varTypes.end(); ) {
+            const std::string& k = it6->first;
+            if (k.substr(0,5) != "self." && !globalVarNames.count(k))
+                it6 = varTypes.erase(it6);
+            else ++it6;
+        }
+
+        // Record parameter types (may shadow globals — save them)
         for (auto& p : pd->params) {
             std::string lo = p.name; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            if (globalVarNames.count(lo)) savedGlobals[lo] = varTypes[lo];
             varTypes[lo] = p.type;
         }
         if (pd->is_function) {
             std::string lo = pd->name; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
             varTypes[lo + "__ret"] = pd->return_type;
         }
+
+        // Check for method: name contains dot
+        std::string procName = pd->name;
+        std::string methodTypeName, methodFuncName;
+        {
+            std::string lo = procName;
+            std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            auto dot = lo.find('.');
+            if (dot != std::string::npos) {
+                methodTypeName = lo.substr(0, dot);
+                methodFuncName = lo.substr(dot + 1);
+                procName = methodTypeName + "_" + methodFuncName;
+            } else {
+                procName = lo;  // lowercase to match calls
+            }
+        }
+        currentMethodType = methodTypeName; // set so genExpr emits self->field
+
         std::string ret = pd->is_function ? cType(pd->return_type) : "void";
-        std::string sig = ret + " " + safeId(pd->name) + "(";
+        std::string sig = ret + " pas_" + procName + "(";
+        // For methods, add self pointer as first param
+        if (!methodTypeName.empty()) {
+            sig += "struct pas_rec_" + methodTypeName + "* self";
+            if (!pd->params.empty()) sig += ", ";
+            // Fields accessible as self->pas_field — record in varTypes with special prefix
+            if (g_recordTypes.count(methodTypeName)) {
+                for (auto& [fn, ft] : getAllFields(methodTypeName)) {
+                    std::string flo = fn;
+                    std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+                    varTypes["self." + flo] = ft;
+                }
+            }
+        }
         for (size_t i = 0; i < pd->params.size(); i++) {
-            if (i) sig += ", ";
+            if (i && methodTypeName.empty()) sig += ", ";
+            else if (i) sig += ", ";
             std::string ct = cType(pd->params[i].type);
-            if (ct == "char*") ct = "char*";
             if (pd->params[i].by_ref) ct += "*";
             sig += ct + " " + safeId(pd->params[i].name);
         }
@@ -2043,7 +2652,7 @@ class Compiler {
         if (pd->is_function) {
             std::string rt = cType(pd->return_type);
             if (rt == "char*")
-                emitind("char _ret_[1024] = \"\";");
+                emitind("static char _ret_[1024] = \"\";");  // static avoids dangling pointer
             else
                 emitind(rt + " _ret_ = 0;");
         }
@@ -2076,6 +2685,10 @@ class Compiler {
         emitind("}");
         emitln();
         currentFunc = prevFunc;
+        currentMethodType = "";
+        // Restore any globals that were shadowed by params
+        for (auto& [k,v] : savedGlobals) varTypes[k] = v;
+        currentMethodType = "";
     }
 
 public:
@@ -2121,6 +2734,7 @@ public:
         emitln("#include <time.h>");
         emitln("#include <ctype.h>");
         emitln("#include <stdarg.h>");
+emitln("#include <string.h>");
         emitln();
 
         // Graphics — full SDL2 implementation inline, or stubs if no SDL2
@@ -2375,10 +2989,10 @@ public:
         // so they're available for proc/func parameter types
         if (!g_recordTypes.empty()) {
             emitln("/* Record type definitions */");
-            for (auto& [tname, fields] : g_recordTypes) {
+            for (auto& [tname, tdef] : g_recordTypes) {
                 if (!emittedStructs.count(tname)) {
                     emittedStructs.insert(tname);
-                    emitRecordStruct(tname, fields);
+                    emitRecordStruct(tname, getAllFields(tname));
                 }
             }
             emitln();
@@ -2389,6 +3003,37 @@ public:
         for (auto& d : prog->declarations)
             if (dynamic_cast<ProcDef*>(d.get()))
                 genForwardDecl(d);
+        // Forward declare __virt dispatchers
+        for (auto& [baseType, baseDef] : g_recordTypes) {
+            for (auto& [methName, methPd] : baseDef.methods) {
+                bool hasOverride = false;
+                for (auto& [childType, childDef] : g_recordTypes) {
+                    if (childType == baseType) continue;
+                    std::string anc = childDef.parent;
+                    while (!anc.empty()) {
+                        if (anc == baseType) {
+                            auto mit3 = childDef.methods.find(methName);
+                            if (mit3 != childDef.methods.end() &&
+                                mit3->second->params.size() == methPd->params.size())
+                                hasOverride = true;
+                            break;
+                        }
+                        auto ait = g_recordTypes.find(anc);
+                        if (ait == g_recordTypes.end()) break;
+                        anc = ait->second.parent;
+                    }
+                    if (hasOverride) break;
+                }
+                if (!hasOverride) continue;
+                std::string ret = methPd->is_function ? cType(methPd->return_type) : "void";
+                std::string sig = ret + " pas_" + baseType + "_" + methName + "__virt(";
+                sig += "struct pas_rec_" + baseType + "* self";
+                for (auto& p : methPd->params)
+                    sig += ", " + cType(p.type) + " " + safeId(p.name);
+                sig += ");";
+                emitind(sig);
+            }
+        }
         emitln();
 
         // ── Global variables & constants ──────
@@ -2403,9 +3048,70 @@ public:
             if (dynamic_cast<ProcDef*>(d.get()))
                 genProcDef(d);
 
+        // ── Virtual dispatch functions ─────────
+        // For each method in a base type that is overridden in a child type,
+        // emit a __virt dispatcher that checks self->__type__ at runtime.
+        for (auto& [baseType, baseDef] : g_recordTypes) {
+            for (auto& [methName, methPd] : baseDef.methods) {
+                // Collect child types that override this method WITH THE SAME SIGNATURE
+                std::vector<std::string> overriders;
+                for (auto& [childType, childDef] : g_recordTypes) {
+                    if (childType == baseType) continue;
+                    std::string anc = childDef.parent;
+                    bool isChild = false;
+                    while (!anc.empty()) {
+                        if (anc == baseType) { isChild = true; break; }
+                        auto ait = g_recordTypes.find(anc);
+                        if (ait == g_recordTypes.end()) break;
+                        anc = ait->second.parent;
+                    }
+                    if (!isChild) continue;
+                    auto mit = childDef.methods.find(methName);
+                    if (mit == childDef.methods.end()) continue;
+                    // Only if same number of params (same signature)
+                    if (mit->second->params.size() == methPd->params.size())
+                        overriders.push_back(childType);
+                }
+                if (overriders.empty()) continue;
+
+                // Build the __virt function signature matching the base method
+                std::string ret = methPd->is_function ? cType(methPd->return_type) : "void";
+                std::string sig = ret + " pas_" + baseType + "_" + methName + "__virt(";
+                sig += "struct pas_rec_" + baseType + "* self";
+                for (auto& p : methPd->params) {
+                    sig += ", " + cType(p.type) + " " + safeId(p.name);
+                }
+                sig += ")";
+                emitind(sig + " {");
+                indent++;
+                // Check each overriding child type
+                for (auto& childType : overriders) {
+                    std::string paramList = "((struct pas_rec_" + childType + "*)self)";
+                    for (auto& p : methPd->params)
+                        paramList += ", " + safeId(p.name);
+                    emitind("if (strcmp(self->__type__, \"" + childType + "\") == 0)");
+                    std::string callLine = (methPd->is_function ? std::string("return ") : std::string("")) +
+                            "pas_" + childType + "_" + methName + "(" + paramList + ");";
+                    emitind("    " + callLine);
+                }
+                // Base fallback
+                std::string baseCall = "pas_" + baseType + "_" + methName + "(self";
+                for (auto& p : methPd->params)
+                    baseCall += ", " + safeId(p.name);
+                baseCall += ")";
+                emitind(std::string(methPd->is_function ? "return " : "") + baseCall + ";");
+                indent--;
+                emitind("}");
+                emitln();
+            }
+        }
+
         // ── main ──────────────────────────────
         emitln("int main(void) {");
         indent++;
+        // Initialize __type__ for all global object variables
+        for (auto& [varId, typeName] : globalObjVars)
+            emitind("strncpy(" + varId + ".__type__, \"" + typeName + "\", 63);");
         auto* body = dynamic_cast<CompoundNode*>(prog->body.get());
         if (body) {
             for (auto& s : body->statements) genStmt(s);

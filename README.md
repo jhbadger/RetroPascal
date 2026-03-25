@@ -315,7 +315,7 @@ The compiler embeds a complete SDL2 graphics implementation directly in the gene
 
 - Arrays are 1D only (no multi-dimensional arrays)
 - No `unit` / `uses` support (single-file programs only)
-- No records (`record`) or pointers
+- No pointers
 - No `case` statement in the compiler (interpreter only)
 - Strings in compiled programs use fixed 1024-byte buffers
 - The compiler infers print format from static type analysis — complex expressions with mixed types may occasionally need explicit casting

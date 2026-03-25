@@ -1,4 +1,3 @@
-#!/usr/bin/env pascal
 program facter;
 
 function fact(x: integer) : integer;

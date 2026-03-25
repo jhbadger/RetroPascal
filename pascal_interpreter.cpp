@@ -1343,7 +1343,8 @@ class Interpreter {
         auto it = procs.find(name);
         if (it == procs.end()) {
             // Inside a method — try as self method call
-            if (!selfStack.empty()) {
+            // BUT only if there's no free function with this name
+            if (!selfStack.empty() && !procs.count(name)) {
                 auto& [selfPtr2, selfType2] = selfStack.back();
                 auto pd2 = findMethod(selfType2, name);
                 if (pd2) {
@@ -1800,13 +1801,18 @@ class Compiler {
         std::string typeName = getExprTypeName(n->object);
         std::transform(typeName.begin(), typeName.end(), typeName.begin(), ::tolower);
         // Walk parent chain to find where method is defined
+        // Check both declared methods (in type section) and implemented procs
         std::string definingType = typeName;
         {
             std::string cur = typeName;
             while (!cur.empty()) {
                 auto it = g_recordTypes.find(cur);
                 if (it == g_recordTypes.end()) break;
+                // Check declared methods
                 if (it->second.methods.count(n->method)) { definingType = cur; break; }
+                // Check implemented procs (e.g. Pet.init declared without header)
+                std::string fullName = cur + "." + n->method;
+                if (userProcs.count(fullName)) { definingType = cur; break; }
                 cur = it->second.parent;
             }
         }

@@ -53,7 +53,7 @@ enum class TokenType {
     // Keywords
     PROGRAM, VAR, CONST, BEGIN, END, IF, THEN, ELSE,
     WHILE, DO, FOR, TO, DOWNTO, REPEAT, UNTIL,
-    PROCEDURE, FUNCTION, ARRAY, OF, RECORD,
+    PROCEDURE, FUNCTION, ARRAY, OF, RECORD, TYPE,
     DIV, MOD, AND, OR, NOT, XOR,
     TRUE, FALSE,
     INTEGER, REAL, BOOLEAN, STRING, CHAR,
@@ -82,7 +82,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"downto",    TokenType::DOWNTO},    {"repeat",    TokenType::REPEAT},
     {"until",     TokenType::UNTIL},     {"procedure", TokenType::PROCEDURE},
     {"function",  TokenType::FUNCTION},  {"array",     TokenType::ARRAY},
-    {"of",        TokenType::OF},        {"record",    TokenType::RECORD},
+    {"of",        TokenType::OF},        {"record",    TokenType::RECORD},  {"type",      TokenType::TYPE},
     {"div",       TokenType::DIV},       {"mod",       TokenType::MOD},
     {"and",       TokenType::AND},       {"or",        TokenType::OR},
     {"not",       TokenType::NOT},       {"xor",       TokenType::XOR},
@@ -275,12 +275,20 @@ struct ProcDef : ASTNode {
 
 struct VarDecl : ASTNode {
     std::vector<std::string> names;
-    std::string type_name;
+    std::string type_name;          // pascal type name
     int array_lo = 0, array_hi = 0;
     bool is_array = false;
+    bool is_record = false;         // inline record type
+    // field defs when is_record: list of (fieldName, typeName)
+    std::vector<std::pair<std::string,std::string>> record_fields;
 };
 
 struct ConstDecl : ASTNode { std::string name; ASTPtr value; };
+struct FieldAccessNode : ASTNode { ASTPtr record; std::string field; };
+
+// Maps type name (lower) -> list of (fieldName, typeName) pairs
+static std::unordered_map<std::string, std::vector<std::pair<std::string,std::string>>> g_recordTypes;
+
 
 // ─────────────────────────────────────────────
 //  Parser
@@ -316,6 +324,24 @@ public:
     }
 
 private:
+    // Parse a record field list: returns list of (fieldName, typeName)
+    std::vector<std::pair<std::string,std::string>> parseRecordFields() {
+        std::vector<std::pair<std::string,std::string>> fields;
+        while (!check(TokenType::END) && !check(TokenType::EOF_TOKEN)) {
+            if (!check(TokenType::IDENTIFIER)) break;
+            std::vector<std::string> fnames;
+            fnames.push_back(consume().value);
+            while (match(TokenType::COMMA))
+                fnames.push_back(expect(TokenType::IDENTIFIER).value);
+            expect(TokenType::COLON);
+            std::string ftype = consume().value;
+            match(TokenType::SEMICOLON);
+            for (auto& fn : fnames)
+                fields.push_back({fn, ftype});
+        }
+        return fields;
+    }
+
     void parseDeclarations(std::vector<ASTPtr>& decls) {
         while (true) {
             if (check(TokenType::VAR)) {
@@ -324,6 +350,25 @@ private:
             } else if (check(TokenType::CONST)) {
                 consume();
                 parseConstSection(decls);
+            } else if (check(TokenType::TYPE)) {
+                // TYPE section: type Foo = record ... end;
+                consume(); // eat "type"
+                while (check(TokenType::IDENTIFIER)) {
+                    std::string typeName = consume().value;
+                    std::transform(typeName.begin(), typeName.end(), typeName.begin(), ::tolower);
+                    expect(TokenType::EQ);
+                    if (check(TokenType::RECORD)) {
+                        consume(); // eat 'record'
+                        auto fields = parseRecordFields();
+                        expect(TokenType::END);
+                        match(TokenType::SEMICOLON);
+                        g_recordTypes[typeName] = fields;
+                    } else {
+                        // type alias — skip for now
+                        consume();
+                        match(TokenType::SEMICOLON);
+                    }
+                }
             } else if (check(TokenType::PROCEDURE) || check(TokenType::FUNCTION)) {
                 decls.push_back(parseProcOrFunc());
             } else break;
@@ -337,8 +382,22 @@ private:
             while (match(TokenType::COMMA))
                 vd->names.push_back(expect(TokenType::IDENTIFIER).value);
             expect(TokenType::COLON);
-            // Array type
-            if (match(TokenType::ARRAY)) {
+            // Inline record type: var p: record x,y: integer; end;
+            if (check(TokenType::RECORD)) {
+                consume();
+                vd->is_record = true;
+                vd->type_name = "__inline_record__";
+                vd->record_fields = parseRecordFields();
+                expect(TokenType::END);
+                // Register with a synthetic type name based on first field
+                // so the interpreter can create instances
+                static int anonCount = 0;
+                std::string anonName = "__anon_record_" + std::to_string(anonCount++) + "__";
+                g_recordTypes[anonName] = vd->record_fields;
+                vd->type_name = anonName;
+                match(TokenType::SEMICOLON);
+            } else if (match(TokenType::ARRAY)) {
+                // Array type
                 vd->is_array = true;
                 expect(TokenType::LBRACKET);
                 vd->array_lo = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
@@ -346,9 +405,19 @@ private:
                 vd->array_hi = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
                 expect(TokenType::RBRACKET);
                 expect(TokenType::OF);
+                vd->type_name = consume().value;
+                match(TokenType::SEMICOLON);
+            } else {
+                vd->type_name = consume().value;
+                // Check if this is a known record type name
+                std::string lo = vd->type_name;
+                std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                if (g_recordTypes.count(lo)) {
+                    vd->is_record = true;
+                    vd->record_fields = g_recordTypes[lo];
+                }
+                expect(TokenType::SEMICOLON);
             }
-            vd->type_name = consume().value;
-            expect(TokenType::SEMICOLON);
             decls.push_back(vd);
         }
     }
@@ -496,29 +565,46 @@ private:
 
     ASTPtr parseIdentStatement() {
         std::string name = consume().value;
-        // assignment or array index assignment
-        if (check(TokenType::ASSIGN) || check(TokenType::LBRACKET)) {
-            ASTPtr target;
+
+        // Build target: handle field access (p.x, p.a.b) and array index
+        // First accumulate any leading dot-field chains
+        ASTPtr target;
+        {
+            auto varNode = std::make_shared<VarNode>(); varNode->name = name;
+            target = varNode;
+            // Handle dot-field access: p.x.y etc.
+            while (check(TokenType::DOT) && peek(1).type == TokenType::IDENTIFIER) {
+                consume(); // eat '.'
+                std::string fieldName = expect(TokenType::IDENTIFIER).value;
+                auto fa = std::make_shared<FieldAccessNode>();
+                fa->record = target;
+                fa->field  = fieldName;
+                target = fa;
+            }
+            // Handle array index: arr[i] or rec.arr[i]
             if (check(TokenType::LBRACKET)) {
                 auto idx = std::make_shared<IndexNode>();
-                auto varNode = std::make_shared<VarNode>(); varNode->name = name;
-                idx->array = varNode;
+                idx->array = target;
                 consume();
                 idx->index = parseExpr();
                 expect(TokenType::RBRACKET);
                 target = idx;
-            } else {
-                auto v = std::make_shared<VarNode>(); v->name = name; target = v;
             }
+        }
+
+        if (check(TokenType::ASSIGN)) {
             expect(TokenType::ASSIGN);
             auto assign = std::make_shared<AssignNode>();
             assign->target = target;
             assign->value = parseExpr();
             return assign;
         }
-        // procedure/function call
+
+        // Not an assignment — must be a procedure call (target must be plain VarNode)
+        // Rewind: we built up a target but it's actually a call
+        auto* vn = dynamic_cast<VarNode*>(target.get());
         auto call = std::make_shared<CallNode>();
-        call->name = name;
+        call->name = vn ? vn->name : name;
         if (match(TokenType::LPAREN)) {
             call->args.push_back(parseExpr());
             while (match(TokenType::COMMA)) call->args.push_back(parseExpr());
@@ -650,7 +736,20 @@ private:
                 expect(TokenType::RPAREN);
                 return call;
             }
-            auto v = std::make_shared<VarNode>(); v->name = name; return v;
+            // Field access: rec.field (only when DOT followed by identifier)
+            {
+                ASTPtr result = std::make_shared<VarNode>();
+                dynamic_cast<VarNode*>(result.get())->name = name;
+                while (check(TokenType::DOT) && peek(1).type == TokenType::IDENTIFIER) {
+                    consume(); // eat '.'
+                    std::string fieldName = expect(TokenType::IDENTIFIER).value;
+                    auto fa = std::make_shared<FieldAccessNode>();
+                    fa->record = result;
+                    fa->field  = fieldName;
+                    result = fa;
+                }
+                return result;
+            }
         }
         throw std::runtime_error("Unexpected token '" + peek().value + "' at line " + std::to_string(peek().line));
     }
@@ -660,13 +759,14 @@ private:
 //  Runtime Value
 // ─────────────────────────────────────────────
 struct Value {
-    enum class Type { NIL, INT, REAL, BOOL, STRING, CHAR, ARRAY } vtype = Type::NIL;
+    enum class Type { NIL, INT, REAL, BOOL, STRING, CHAR, ARRAY, RECORD } vtype = Type::NIL;
     long long   ival = 0;
     double      rval = 0;
     bool        bval = false;
     std::string sval;
     char        cval = 0;
     std::vector<Value> arr;
+    std::shared_ptr<std::unordered_map<std::string,Value>> fields; // for RECORD
 
     static Value from_int(long long v)    { Value x; x.vtype=Type::INT;    x.ival=v; return x; }
     static Value from_real(double v)      { Value x; x.vtype=Type::REAL;   x.rval=v; return x; }
@@ -709,10 +809,16 @@ struct Value {
                 return oss.str();
             }
             case Type::BOOL:   return bval ? "TRUE" : "FALSE";
+            case Type::RECORD: return "<record>";
             case Type::STRING: return sval;
             case Type::CHAR:   return std::string(1, cval);
             default: return "<nil>";
         }
+    }
+    static Value make_record() {
+        Value x; x.vtype = Type::RECORD;
+        x.fields = std::make_shared<std::unordered_map<std::string,Value>>();
+        return x;
     }
     bool is_numeric() const { return vtype == Type::INT || vtype == Type::REAL; }
 };
@@ -770,6 +876,17 @@ class Interpreter {
         if (auto* n = dynamic_cast<StringNode*>(node.get())) return Value::from_string(n->value);
         if (auto* n = dynamic_cast<CharNode*>(node.get()))   return Value::from_char(n->value);
 
+        if (auto* n = dynamic_cast<FieldAccessNode*>(node.get())) {
+            Value rec = eval(n->record, env);
+            if (rec.vtype != Value::Type::RECORD || !rec.fields)
+                throw std::runtime_error("Not a record");
+            std::string flo = n->field;
+            std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+            auto it = rec.fields->find(flo);
+            if (it == rec.fields->end())
+                throw std::runtime_error("Unknown record field: " + n->field);
+            return it->second;
+        }
         if (auto* n = dynamic_cast<VarNode*>(node.get())) {
             std::string lo = n->name;
             std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
@@ -942,8 +1059,13 @@ class Interpreter {
         if (name == "randomize") { srand((unsigned)time(nullptr)); return Value{}; }
         if (name == "sin")  return Value::from_real(std::sin(eval(arg_nodes[0],env).as_real()));
         if (name == "cos")  return Value::from_real(std::cos(eval(arg_nodes[0],env).as_real()));
+        if (name == "arctan") return Value::from_real(std::atan(eval(arg_nodes[0],env).as_real()));
+        if (name == "arcsin") return Value::from_real(std::asin(eval(arg_nodes[0],env).as_real()));
+        if (name == "arccos") return Value::from_real(std::acos(eval(arg_nodes[0],env).as_real()));
+        if (name == "tan")  return Value::from_real(std::tan(eval(arg_nodes[0],env).as_real()));
         if (name == "exp")  return Value::from_real(std::exp(eval(arg_nodes[0],env).as_real()));
         if (name == "ln")   return Value::from_real(std::log(eval(arg_nodes[0],env).as_real()));
+        if (name == "log")  return Value::from_real(std::log10(eval(arg_nodes[0],env).as_real()));
         if (name == "int")  return Value::from_int((long long)eval(arg_nodes[0],env).as_real());
         if (name == "frac") { double v=eval(arg_nodes[0],env).as_real(); return Value::from_real(v - (long long)v); }
         if (name == "pi")   return Value::from_real(3.14159265358979323846);
@@ -1045,6 +1167,35 @@ class Interpreter {
                 int i = (int)eval(idx->index, env).as_int() - (int)arr.ival;
                 if (i < 0 || i >= (int)arr.arr.size()) throw std::runtime_error("Array index out of bounds");
                 arr.arr[i] = val;
+            } else if (auto* fa = dynamic_cast<FieldAccessNode*>(n->target.get())) {
+                // record field assignment: p.x := val
+                // Walk the chain to find the root variable, then update in place
+                // Build path: root varname + list of field names
+                std::vector<std::string> path;
+                ASTNode* cur = fa;
+                while (auto* fac = dynamic_cast<FieldAccessNode*>(cur)) {
+                    std::string flo = fac->field;
+                    std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+                    path.push_back(flo);
+                    cur = fac->record.get();
+                }
+                auto* rootVar = dynamic_cast<VarNode*>(cur);
+                if (!rootVar) throw std::runtime_error("Invalid record assignment target");
+                std::string rootName = rootVar->name;
+                std::transform(rootName.begin(), rootName.end(), rootName.begin(), ::tolower);
+                // path is reversed (innermost first), reverse it
+                std::reverse(path.begin(), path.end());
+                // Get reference to root record and walk/update
+                Value& root = env->get_ref(rootName);
+                Value* rec = &root;
+                for (size_t pi = 0; pi < path.size() - 1; pi++) {
+                    if (rec->vtype != Value::Type::RECORD || !rec->fields)
+                        throw std::runtime_error("Not a record: " + path[pi]);
+                    rec = &(*rec->fields)[path[pi]];
+                }
+                if (rec->vtype != Value::Type::RECORD || !rec->fields)
+                    throw std::runtime_error("Not a record");
+                (*rec->fields)[path.back()] = val;
             } else if (auto* vn = dynamic_cast<VarNode*>(n->target.get())) {
                 std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
                 env->set(lo, val);
@@ -1126,7 +1277,24 @@ class Interpreter {
             if (auto* vd = dynamic_cast<VarDecl*>(d.get())) {
                 for (auto& nm : vd->names) {
                     std::string lo = nm; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
-                    if (vd->is_array) {
+                    if (vd->is_record) {
+                        Value rec = Value::make_record();
+                        for (auto& [fn, ft] : vd->record_fields) {
+                            std::string flo = fn;
+                            std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+                            // initialise each field to a default value based on type
+                            std::string tlo = ft;
+                            std::transform(tlo.begin(), tlo.end(), tlo.begin(), ::tolower);
+                            Value fv;
+                            if (tlo=="integer"||tlo=="longint"||tlo=="word"||tlo=="byte") fv=Value::from_int(0);
+                            else if (tlo=="real"||tlo=="double"||tlo=="single") fv=Value::from_real(0.0);
+                            else if (tlo=="boolean") fv=Value::from_bool(false);
+                            else if (tlo=="char")    fv=Value::from_char('\0');
+                            else if (tlo=="string")  fv=Value::from_string("");
+                            (*rec.fields)[flo] = fv;
+                        }
+                        env->set_local(lo, rec);
+                    } else if (vd->is_array) {
                         env->set_local(lo, Value::make_array(vd->array_lo, vd->array_hi));
                     } else {
                         std::string type = vd->type_name;
@@ -1145,9 +1313,6 @@ class Interpreter {
                 env->set_local(lo, eval(cd->value, env));
             } else if (auto* pd = dynamic_cast<ProcDef*>(d.get())) {
                 std::string lo = pd->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
-                procs[lo] = std::shared_ptr<ProcDef>(pd, [](ProcDef*){});
-                // Store raw pointer wrapped — safe because pd lives in the AST
-                // Actually we need a proper shared_ptr
                 procs[lo] = std::make_shared<ProcDef>(*pd);
             }
         }
@@ -1189,11 +1354,11 @@ int main(int argc, char* argv[]) {
         std::ifstream f(inputFile);
         if (!f) { std::cerr << "Cannot open file: " << inputFile << "\n"; return 1; }
         source = std::string(std::istreambuf_iterator<char>(f), {});
-    }
-    // Strip shebang line so the file can be used as a script: #!/usr/bin/env pascal
-    if (source.size() >= 2 && source[0] == '#' && source[1] == '!') {
-        auto nl = source.find('\n');
-        source = (nl == std::string::npos) ? "" : source.substr(nl + 1);
+        // Strip shebang line so the file can be used as a script: #!/usr/bin/env pascal
+        if (source.size() >= 2 && source[0] == '#' && source[1] == '!') {
+            auto nl = source.find('\n');
+            source = (nl == std::string::npos) ? "" : source.substr(nl + 1);
+        }
     } else if (!doCompile) {
         std::cout << "Pascal Interpreter - reading from stdin...\n";
         source = std::string(std::istreambuf_iterator<char>(std::cin), {});
@@ -1264,6 +1429,8 @@ class Compiler {
         if (t == "boolean")                                                    return "int";
         if (t == "char")                                                        return "char";
         if (t == "string")                                                      return "char*";
+        // Check if it's a known record type
+        if (g_recordTypes.count(t)) return "struct pas_rec_" + t;
         return "long long"; // default
     }
 
@@ -1291,6 +1458,47 @@ class Compiler {
 
     // ── Expression codegen ────────────────────
 
+    // Get the Pascal type name of a field access expression
+    std::string getFieldType(const FieldAccessNode* fa) const {
+        // Walk to the root VarNode to get the record type
+        std::vector<std::string> fields;
+        const ASTNode* cur = fa;
+        while (auto* fac = dynamic_cast<const FieldAccessNode*>(cur)) {
+            std::string flo = fac->field;
+            std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+            fields.push_back(flo);
+            cur = fac->record.get();
+        }
+        std::reverse(fields.begin(), fields.end());
+        const VarNode* root = dynamic_cast<const VarNode*>(cur);
+        if (!root) return "";
+        std::string rlo = root->name;
+        std::transform(rlo.begin(), rlo.end(), rlo.begin(), ::tolower);
+        // Find record type name
+        auto it = varTypes.find(rlo);
+        if (it == varTypes.end()) return "";
+        std::string typeName = it->second;
+        std::transform(typeName.begin(), typeName.end(), typeName.begin(), ::tolower);
+        // Walk through nested fields
+        for (size_t i = 0; i < fields.size(); i++) {
+            auto git = g_recordTypes.find(typeName);
+            if (git == g_recordTypes.end()) return "";
+            bool found = false;
+            for (auto& [fn, ft] : git->second) {
+                std::string flo2 = fn;
+                std::transform(flo2.begin(), flo2.end(), flo2.begin(), ::tolower);
+                if (flo2 == fields[i]) {
+                    typeName = ft;
+                    std::transform(typeName.begin(), typeName.end(), typeName.begin(), ::tolower);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return "";
+        }
+        return typeName;
+    }
+
     // Returns true if this expression is real-valued (real var, real literal,
     // function returning real, or binary op with a real operand)
     bool isRealExpr(const ASTPtr& node) {
@@ -1307,6 +1515,9 @@ class Compiler {
             }
             return false;
         }
+        if (auto* n = dynamic_cast<FieldAccessNode*>(node.get())) {
+            return getFieldType(n) == "real";
+        }
         if (auto* n = dynamic_cast<BinOpNode*>(node.get())) {
             if (n->op == "/") return true;
             return isRealExpr(n->left) || isRealExpr(n->right);
@@ -1319,9 +1530,8 @@ class Compiler {
             std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
             // math functions always return real
             static const std::set<std::string> realFns = {
-                "sqrt","sin","cos","exp","ln","log","pi","frac","random",
-                "arctan","arcsin","arccos","tan","int",
-                "power" // common user function name
+                "sqrt","sin","cos","tan","exp","ln","log","pi","frac","random",
+                "arctan","arcsin","arccos","int","power"
             };
             if (realFns.count(lo)) return true;
             // Check user proc return type
@@ -1364,6 +1574,13 @@ class Compiler {
                 else escaped += c;
             }
             return "\"" + escaped + "\"";
+        }
+        if (auto* n = dynamic_cast<FieldAccessNode*>(node.get())) {
+            // Build: safeId(root).field1.field2...
+            std::string expr = genExpr(n->record);
+            std::string flo = n->field;
+            std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+            return expr + ".pas_" + flo;
         }
         if (auto* n = dynamic_cast<VarNode*>(node.get())) {
             std::string lo = n->name;
@@ -1553,6 +1770,29 @@ class Compiler {
                 std::string i    = genExpr(idx->index);
                 std::string val  = genExpr(n->value);
                 emitind(base + "[" + i + " - " + base + "_lo] = " + val + ";");
+            } else if (dynamic_cast<FieldAccessNode*>(n->target.get())) {
+                // Record field assignment
+                std::string lhs = genExpr(n->target);
+                std::string rhs = genExpr(n->value);
+                // String fields need strcpy
+                bool isStr = dynamic_cast<StringNode*>(n->value.get()) != nullptr;
+                if (!isStr) {
+                    // Check if it's a string variable
+                    if (auto* vn2 = dynamic_cast<VarNode*>(n->value.get())) {
+                        std::string vlo2 = vn2->name;
+                        std::transform(vlo2.begin(), vlo2.end(), vlo2.begin(), ::tolower);
+                        auto it2 = varTypes.find(vlo2);
+                        if (it2 != varTypes.end()) {
+                            std::string t2 = it2->second;
+                            std::transform(t2.begin(), t2.end(), t2.begin(), ::tolower);
+                            if (t2 == "string") isStr = true;
+                        }
+                    }
+                }
+                if (isStr)
+                    emitind("strncpy(" + lhs + ", " + rhs + ", 1023);");
+                else
+                    emitind(lhs + " = " + rhs + ";");
             } else if (auto* vn = dynamic_cast<VarNode*>(n->target.get())) {
                 std::string vlo = vn->name;
                 std::transform(vlo.begin(), vlo.end(), vlo.begin(), ::tolower);
@@ -1628,6 +1868,17 @@ class Compiler {
                         emitind("pas_print_ll((long long)(" + e + "));");
                     else
                         emitind("pas_print_d((double)(" + e + "));");
+                } else if (auto* fa = dynamic_cast<FieldAccessNode*>(arg.get())) {
+                    // Record field — look up field type
+                    std::string ftype = getFieldType(fa);
+                    if (ftype == "real" || ftype == "double" || ftype == "single")
+                        emitind("pas_print_d((double)(" + e + "));");
+                    else if (ftype == "char")
+                        emitind("pas_print_c((char)(" + e + "));");
+                    else if (ftype == "string")
+                        emitind("pas_print_s(" + e + ");");
+                    else
+                        emitind("pas_print_ll((long long)(" + e + "));");
                 } else if (auto* vn = dynamic_cast<VarNode*>(arg.get())) {
                     // Variable — look up type and use correct print function
                     std::string lo = vn->name;
@@ -1687,14 +1938,44 @@ class Compiler {
     }
 
     // ── Declaration codegen ───────────────────
+    // Emit a C struct definition for a record type (once per type name)
+    void emitRecordStruct(const std::string& typeName,
+                          const std::vector<std::pair<std::string,std::string>>& fields) {
+        // C structs cannot have initializers in member declarations
+        std::string sname = "struct pas_rec_" + typeName;
+        emitind(sname + " {");
+        indent++;
+        for (auto& [fn, ft] : fields) {
+            std::string ct = cType(ft);
+            std::string fid = "pas_" + fn;
+            std::transform(fid.begin(), fid.end(), fid.begin(), ::tolower);
+            if (ct == "char*")
+                emitind("char " + fid + "[1024];");
+            else
+                emitind(ct + " " + fid + ";");
+        }
+        indent--;
+        emitind("};");
+    }
+
+    std::set<std::string> emittedStructs; // avoid duplicate struct defs
+
     void genDecl(const ASTPtr& node, bool global) {
         if (auto* vd = dynamic_cast<VarDecl*>(node.get())) {
             for (auto& nm : vd->names) {
                 std::string id = safeId(nm);
-                // Record type for print dispatch
                 std::string lo = nm; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
                 varTypes[lo] = vd->type_name;
-                if (vd->is_array) {
+                if (vd->is_record) {
+                    // Emit the struct type if not already done
+                    std::string tlo = vd->type_name;
+                    std::transform(tlo.begin(), tlo.end(), tlo.begin(), ::tolower);
+                    if (!emittedStructs.count(tlo)) {
+                        emittedStructs.insert(tlo);
+                        emitRecordStruct(tlo, vd->record_fields);
+                    }
+                    emitind("struct pas_rec_" + tlo + " " + id + " = {0};");
+                } else if (vd->is_array) {
                     int sz = vd->array_hi - vd->array_lo + 1;
                     emitind(cType(vd->type_name) + " " + id + "[" + std::to_string(sz) + "];");
                     emitind("const int " + id + "_lo = " + std::to_string(vd->array_lo) + ";");
@@ -2088,6 +2369,20 @@ public:
         emitln("    va_end(ap); return _concat_buf;");
         emitln("}");
         emitln();
+
+        // ── Record type struct definitions ─────
+        // Emit structs for all TYPE-declared records before forward declarations
+        // so they're available for proc/func parameter types
+        if (!g_recordTypes.empty()) {
+            emitln("/* Record type definitions */");
+            for (auto& [tname, fields] : g_recordTypes) {
+                if (!emittedStructs.count(tname)) {
+                    emittedStructs.insert(tname);
+                    emitRecordStruct(tname, fields);
+                }
+            }
+            emitln();
+        }
 
         // ── Forward declarations ──────────────
         emitln("/* Forward declarations */");

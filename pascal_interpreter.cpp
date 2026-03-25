@@ -36,6 +36,7 @@
 #include <cctype>
 #include <variant>
 #include <unistd.h>
+#include <chrono>
 #include <functional>
 #include <iomanip>
 #include <set>
@@ -53,7 +54,7 @@ enum class TokenType {
     // Keywords
     PROGRAM, VAR, CONST, BEGIN, END, IF, THEN, ELSE,
     WHILE, DO, FOR, TO, DOWNTO, REPEAT, UNTIL,
-    PROCEDURE, FUNCTION, ARRAY, OF, RECORD, TYPE, OBJECT,
+    PROCEDURE, FUNCTION, ARRAY, OF, RECORD, TYPE, OBJECT, USES, LABEL, GOTO, CASE, OTHERWISE,
     DIV, MOD, AND, OR, NOT, XOR,
     TRUE, FALSE,
     INTEGER, REAL, BOOLEAN, STRING, CHAR,
@@ -84,6 +85,12 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"function",  TokenType::FUNCTION},  {"array",     TokenType::ARRAY},
     {"of",        TokenType::OF},        {"record",    TokenType::RECORD},  {"type",      TokenType::TYPE},
     {"object",    TokenType::OBJECT},
+    {"uses",      TokenType::USES},
+    {"label",     TokenType::LABEL},
+    {"goto",      TokenType::GOTO},
+    {"case",      TokenType::CASE},
+    {"of",        TokenType::OF},
+    {"otherwise", TokenType::OTHERWISE},
     {"div",       TokenType::DIV},       {"mod",       TokenType::MOD},
     {"and",       TokenType::AND},       {"or",        TokenType::OR},
     {"not",       TokenType::NOT},       {"xor",       TokenType::XOR},
@@ -206,6 +213,16 @@ public:
                 case ',': tokens.push_back({TokenType::COMMA,     ",", tok_line}); break;
                 case '=': tokens.push_back({TokenType::EQ,        "=", tok_line}); break;
                 case '^': tokens.push_back({TokenType::XOR,       "xor", tok_line}); break;
+                case '#': {
+                    // #N  — Turbo Pascal numeric char literal e.g. #13 #27
+                    std::string num;
+                    while (pos < src.size() && isdigit(src[pos]))
+                        num += src[pos++];
+                    if (num.empty()) throw std::runtime_error("Expected digit after '#'");
+                    char ch = (char)std::stoi(num);
+                    tokens.push_back({TokenType::CHAR_LITERAL, std::string(1, ch), tok_line});
+                    break;
+                }
                 case ':':
                     if (peek() == '=') { advance(); tokens.push_back({TokenType::ASSIGN, ":=", tok_line}); }
                     else tokens.push_back({TokenType::COLON, ":", tok_line});
@@ -257,7 +274,7 @@ struct RepeatNode     : ASTNode { ASTPtr body, cond; };
 struct WriteNode      : ASTNode { std::vector<ASTPtr> args; bool newline; };
 struct ReadNode       : ASTNode { std::vector<ASTPtr> vars; bool newline; };
 struct CallNode       : ASTNode { std::string name; std::vector<ASTPtr> args; };
-struct IndexNode      : ASTNode { ASTPtr array; ASTPtr index; };
+struct IndexNode      : ASTNode { ASTPtr array; ASTPtr index; std::vector<ASTPtr> indices; };
 struct ProgramNode    : ASTNode {
     std::string name;
     std::vector<ASTPtr> declarations;  // procs/funcs/vars/consts
@@ -274,18 +291,24 @@ struct ProcDef : ASTNode {
     std::string return_type;
 };
 
+struct ArrayDim { int lo, hi; };
 struct VarDecl : ASTNode {
     std::vector<std::string> names;
     std::string type_name;          // pascal type name
     int array_lo = 0, array_hi = 0;
     bool is_array = false;
+    std::vector<ArrayDim> array_dims; // multi-dim support
     bool is_record = false;         // inline record type
-    // field defs when is_record: list of (fieldName, typeName)
     std::vector<std::pair<std::string,std::string>> record_fields;
 };
 
 struct ConstDecl : ASTNode { std::string name; ASTPtr value; };
 struct FieldAccessNode : ASTNode { ASTPtr record; std::string field; };
+struct GotoNode        : ASTNode { std::string label; };
+struct LabelNode       : ASTNode { std::string label; ASTPtr stmt; };
+struct SetMemberNode   : ASTNode { ASTPtr expr; std::vector<ASTPtr> elements; };
+struct CaseBranch { std::vector<ASTPtr> values; ASTPtr body; };
+struct CaseNode : ASTNode { ASTPtr expr; std::vector<CaseBranch> branches; ASTPtr else_branch; };
 struct MethodCallNode  : ASTNode {
     ASTPtr object;
     std::string method;
@@ -388,7 +411,19 @@ private:
 
     void parseDeclarations(std::vector<ASTPtr>& decls) {
         while (true) {
-            if (check(TokenType::VAR)) {
+            if (check(TokenType::USES)) {
+                // uses wincrt, winprocs; — just skip it
+                consume();
+                while (!check(TokenType::SEMICOLON) && !check(TokenType::EOF_TOKEN))
+                    consume();
+                match(TokenType::SEMICOLON);
+            } else if (check(TokenType::LABEL)) {
+                // label back, new_game, continue; — parse and ignore (labels handled at stmt level)
+                consume();
+                while (!check(TokenType::SEMICOLON) && !check(TokenType::EOF_TOKEN))
+                    consume();
+                match(TokenType::SEMICOLON);
+            } else if (check(TokenType::VAR)) {
                 consume();
                 parseVarSection(decls);
             } else if (check(TokenType::CONST)) {
@@ -484,12 +519,26 @@ private:
                 vd->type_name = anonName;
                 match(TokenType::SEMICOLON);
             } else if (match(TokenType::ARRAY)) {
-                // Array type
+                // Array type — may be multi-dimensional: array[1..16, 1..61]
                 vd->is_array = true;
                 expect(TokenType::LBRACKET);
+                // First dimension
                 vd->array_lo = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
                 expect(TokenType::DOTDOT);
                 vd->array_hi = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
+                vd->array_dims.push_back({vd->array_lo, vd->array_hi});
+                // Additional dimensions: , lo..hi
+                while (match(TokenType::COMMA)) {
+                    ArrayDim d;
+                    d.lo = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
+                    expect(TokenType::DOTDOT);
+                    d.hi = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
+                    vd->array_dims.push_back(d);
+                    // Extend the flat size: total = product of all dimensions
+                    vd->array_hi = vd->array_lo + 
+                        (vd->array_dims[0].hi - vd->array_dims[0].lo + 1) *
+                        (d.hi - d.lo + 1) - 1;
+                }
                 expect(TokenType::RBRACKET);
                 expect(TokenType::OF);
                 vd->type_name = consume().value;
@@ -581,7 +630,57 @@ private:
         if (check(TokenType::REPEAT))    return parseRepeat();
         if (check(TokenType::WRITE) || check(TokenType::WRITELN)) return parseWrite();
         if (check(TokenType::READ) || check(TokenType::READLN))   return parseRead();
-        if (check(TokenType::IDENTIFIER)) return parseIdentStatement();
+
+        // CASE statement
+        if (check(TokenType::CASE)) {
+            consume(); // 'case'
+            auto node = std::make_shared<CaseNode>();
+            node->expr = parseExpr();
+            expect(TokenType::OF);
+            while (!check(TokenType::END) && !check(TokenType::OTHERWISE) &&
+                   !check(TokenType::EOF_TOKEN)) {
+                if (check(TokenType::SEMICOLON)) { consume(); continue; }
+                if (check(TokenType::END) || check(TokenType::OTHERWISE)) break;
+                CaseBranch branch;
+                branch.values.push_back(parseExpr());
+                while (match(TokenType::COMMA))
+                    branch.values.push_back(parseExpr());
+                expect(TokenType::COLON);
+                branch.body = parseStatement();
+                match(TokenType::SEMICOLON);
+                node->branches.push_back(std::move(branch));
+            }
+            if (check(TokenType::OTHERWISE)) {
+                consume();
+                node->else_branch = parseStatement();
+                match(TokenType::SEMICOLON);
+            }
+            expect(TokenType::END);
+            return node;
+        }
+
+        // GOTO statement
+        if (check(TokenType::GOTO)) {
+            consume();
+            auto g = std::make_shared<GotoNode>();
+            g->label = consume().value;
+            return g;
+        }
+
+        // IDENTIFIER: (label) or identifier statement
+        if (check(TokenType::IDENTIFIER)) {
+            // Label definition: name: stmt
+            if (peek(1).type == TokenType::COLON) {
+                auto lbl = std::make_shared<LabelNode>();
+                lbl->label = consume().value;
+                consume(); // ':'
+                if (!check(TokenType::SEMICOLON) && !check(TokenType::END) &&
+                    !check(TokenType::UNTIL) && !check(TokenType::EOF_TOKEN))
+                    lbl->stmt = parseStatement();
+                return lbl;
+            }
+            return parseIdentStatement();
+        }
         return std::make_shared<CompoundNode>(); // empty
     }
 
@@ -659,6 +758,27 @@ private:
 
     ASTPtr parseIdentStatement() {
         std::string name = consume().value;
+        std::string nameLo = name;
+        std::transform(nameLo.begin(), nameLo.end(), nameLo.begin(), ::tolower);
+
+        // Special: str(expr:width, var) — Turbo Pascal format
+        if (nameLo == "str" && check(TokenType::LPAREN)) {
+            consume(); // '('
+            auto valExpr = parseExpr();
+            ASTPtr widthExpr;
+            if (match(TokenType::COLON))
+                widthExpr = parseExpr();
+            expect(TokenType::COMMA);
+            auto destExpr = parseExpr(); // should be VarNode
+            expect(TokenType::RPAREN);
+            auto call = std::make_shared<CallNode>();
+            call->name = "str";
+            call->args.push_back(valExpr);
+            if (widthExpr) call->args.push_back(widthExpr);
+            else call->args.push_back(std::make_shared<NumberNode>()); // placeholder 0
+            call->args.push_back(destExpr);
+            return call;
+        }
 
         // Build target: handle field access (p.x, p.a.b) and array index
         // First accumulate any leading dot-field chains
@@ -675,12 +795,15 @@ private:
                 fa->field  = fieldName;
                 target = fa;
             }
-            // Handle array index: arr[i] or rec.arr[i]
+            // Handle array index: arr[i] or arr[i, j]
             if (check(TokenType::LBRACKET)) {
                 auto idx = std::make_shared<IndexNode>();
                 idx->array = target;
                 consume();
-                idx->index = parseExpr();
+                idx->indices.push_back(parseExpr());
+                while (match(TokenType::COMMA))
+                    idx->indices.push_back(parseExpr());
+                idx->index = idx->indices[0];
                 expect(TokenType::RBRACKET);
                 target = idx;
             }
@@ -757,6 +880,20 @@ private:
     }
     ASTPtr parseComparison() {
         auto left = parseAddSub();
+        // Check for 'in [...]' set membership: expr in [a, b, c]
+        if (peek().type == TokenType::IDENTIFIER && peek().value == "in") {
+            consume(); // eat 'in'
+            expect(TokenType::LBRACKET);
+            auto set = std::make_shared<SetMemberNode>();
+            set->expr = left;
+            if (!check(TokenType::RBRACKET)) {
+                set->elements.push_back(parseExpr());
+                while (match(TokenType::COMMA))
+                    set->elements.push_back(parseExpr());
+            }
+            expect(TokenType::RBRACKET);
+            return set;
+        }
         while (check(TokenType::EQ) || check(TokenType::NEQ) ||
                check(TokenType::LT) || check(TokenType::LE) ||
                check(TokenType::GT) || check(TokenType::GE)) {
@@ -825,15 +962,23 @@ private:
         }
         if (check(TokenType::IDENTIFIER)) {
             std::string name = consume().value;
-            // Array index
+            // Array index — may be multi-dimensional: a[i, j]
             if (check(TokenType::LBRACKET)) {
-                auto idx = std::make_shared<IndexNode>();
                 auto v = std::make_shared<VarNode>(); v->name = name;
-                idx->array = v;
-                consume();
-                idx->index = parseExpr();
-                expect(TokenType::RBRACKET);
-                return idx;
+                ASTPtr result = v;
+                // Handle chained indexing: a[i][j] (e.g. string array element char)
+                while (check(TokenType::LBRACKET)) {
+                    auto idx = std::make_shared<IndexNode>();
+                    idx->array = result;
+                    consume(); // '['
+                    idx->indices.push_back(parseExpr());
+                    while (match(TokenType::COMMA))
+                        idx->indices.push_back(parseExpr());
+                    idx->index = idx->indices[0];
+                    expect(TokenType::RBRACKET);
+                    result = idx;
+                }
+                return result;
             }
             // Function call
             if (check(TokenType::LPAREN)) {
@@ -881,6 +1026,100 @@ private:
     }
 };
 
+
+// ─────────────────────────────────────────────
+//  Terminal support (gotoxy, clrscr, keypressed, readkey)
+//  Uses ANSI escape sequences + raw mode
+// ─────────────────────────────────────────────
+#include <termios.h>
+#include <fcntl.h>
+#include <sys/select.h>
+
+static struct termios _orig_termios;
+static bool _raw_mode = false;
+
+static void _disable_raw_mode() {
+    if (_raw_mode) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &_orig_termios);
+        _raw_mode = false;
+    }
+}
+
+static void _enable_raw_mode() {
+    if (_raw_mode) return;
+    tcgetattr(STDIN_FILENO, &_orig_termios);
+    atexit(_disable_raw_mode);
+    struct termios raw = _orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN]  = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    _raw_mode = true;
+}
+
+static void _pas_gotoxy(int x, int y) {
+    printf("\033[%d;%dH", y, x);
+    fflush(stdout);
+}
+
+static void _pas_clrscr() {
+    printf("\033[2J\033[H");
+    fflush(stdout);
+}
+
+static bool _pas_keypressed() {
+    _enable_raw_mode();
+    struct timeval tv = {0, 0};
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0;
+}
+
+// Arrow key codes we return as single chars (above ASCII range mapped to safe values)
+// We use chars that won't collide with normal printable keys:
+// Up='\x01', Down='\x02', Left='\x03', Right='\x04'
+#define KEY_UP    '\x01'
+#define KEY_DOWN  '\x02'
+#define KEY_LEFT  '\x03'
+#define KEY_RIGHT '\x04'
+
+static char _pas_readkey() {
+    _enable_raw_mode();
+    char ch = 0;
+    while (true) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        struct timeval tv = {0, 50000};
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
+            if (read(STDIN_FILENO, &ch, 1) != 1) continue;
+            if (ch == 27) {
+                // Possible escape sequence — check for [ with short timeout
+                struct timeval tv2 = {0, 10000};
+                fd_set fds2; FD_ZERO(&fds2); FD_SET(STDIN_FILENO, &fds2);
+                if (select(STDIN_FILENO + 1, &fds2, nullptr, nullptr, &tv2) > 0) {
+                    char seq[2] = {0, 0};
+                    if (read(STDIN_FILENO, &seq[0], 1) == 1 && seq[0] == '[') {
+                        if (read(STDIN_FILENO, &seq[1], 1) == 1) {
+                            switch (seq[1]) {
+                                case 'A': return KEY_UP;
+                                case 'B': return KEY_DOWN;
+                                case 'C': return KEY_RIGHT;
+                                case 'D': return KEY_LEFT;
+                            }
+                        }
+                    }
+                }
+                return 27; // bare ESC
+            }
+            // Normalise Enter: both CR and LF -> #13
+            if (ch == '\n') ch = '\r';
+            return ch;
+        }
+    }
+}
+
 // ─────────────────────────────────────────────
 //  Runtime Value
 // ─────────────────────────────────────────────
@@ -892,6 +1131,7 @@ struct Value {
     std::string sval;
     char        cval = 0;
     std::vector<Value> arr;
+    std::vector<ArrayDim> arr_dims; // dimension info for multi-dim arrays
     std::shared_ptr<std::unordered_map<std::string,Value>> fields; // for RECORD
 
     static Value from_int(long long v)    { Value x; x.vtype=Type::INT;    x.ival=v; return x; }
@@ -899,10 +1139,11 @@ struct Value {
     static Value from_bool(bool v)        { Value x; x.vtype=Type::BOOL;   x.bval=v; return x; }
     static Value from_string(const std::string& v) { Value x; x.vtype=Type::STRING; x.sval=v; return x; }
     static Value from_char(char v)        { Value x; x.vtype=Type::CHAR;   x.cval=v; return x; }
-    static Value make_array(int lo, int hi) {
+    static Value make_array(int lo, int hi, std::vector<ArrayDim> dims = {}) {
         Value x; x.vtype=Type::ARRAY;
         x.arr.resize(hi - lo + 1);
         x.ival = lo; // store lo in ival
+        x.arr_dims = std::move(dims);
         return x;
     }
 
@@ -986,6 +1227,7 @@ struct Environment {
 //  Interpreter
 // ─────────────────────────────────────────────
 struct ReturnException { Value val; };
+struct GotoException   { std::string label; };
 
 class Interpreter {
     std::unordered_map<std::string, std::shared_ptr<ProcDef>> procs;
@@ -1003,13 +1245,62 @@ class Interpreter {
         if (auto* n = dynamic_cast<StringNode*>(node.get())) return Value::from_string(n->value);
         if (auto* n = dynamic_cast<CharNode*>(node.get()))   return Value::from_char(n->value);
 
+        if (auto* n = dynamic_cast<SetMemberNode*>(node.get())) {
+            Value v = eval(n->expr, env);
+            for (auto& elem : n->elements) {
+                Value e = eval(elem, env);
+                if (v.vtype == Value::Type::CHAR && e.vtype == Value::Type::CHAR)
+                    { if (v.cval == e.cval) return Value::from_bool(true); }
+                else if (v.vtype == Value::Type::STRING && e.vtype == Value::Type::CHAR)
+                    { if (!v.sval.empty() && v.sval[0] == e.cval) return Value::from_bool(true); }
+                else if (v.as_int() == e.as_int()) return Value::from_bool(true);
+            }
+            return Value::from_bool(false);
+        }
         if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
             return evalMethodCall(n, env);
+        }
+        if (auto* n = dynamic_cast<SetMemberNode*>(node.get())) {
+            Value v = eval(n->expr, env);
+            for (auto& elem : n->elements) {
+                Value e = eval(elem, env);
+                if (v.vtype == Value::Type::CHAR && e.vtype == Value::Type::CHAR)
+                    { if (v.cval == e.cval) return Value::from_bool(true); }
+                else if (v.vtype == Value::Type::STRING && e.vtype == Value::Type::CHAR)
+                    { if (!v.sval.empty() && v.sval[0] == e.cval) return Value::from_bool(true); }
+                else if (v.as_int() == e.as_int()) return Value::from_bool(true);
+            }
+            return Value::from_bool(false);
         }
         if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
             return evalMethodCall(n, env);
         }
         if (auto* n = dynamic_cast<FieldAccessNode*>(node.get())) {
+            // Fast path: arr[i].field — access field directly without copying record
+            if (auto* idx = dynamic_cast<IndexNode*>(n->record.get())) {
+                if (auto* vn = dynamic_cast<VarNode*>(idx->array.get())) {
+                    std::string alo = vn->name;
+                    std::transform(alo.begin(), alo.end(), alo.begin(), ::tolower);
+                    std::string flo = n->field;
+                    std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+                    try {
+                        // Evaluate index first
+                        int rawIdx = (int)eval(idx->index, env).as_int();
+                        Value& arr = env->get_ref(alo);
+                        if (arr.vtype == Value::Type::ARRAY) {
+                            int flat = rawIdx - (int)arr.ival;
+                            if (flat >= 0 && flat < (int)arr.arr.size()) {
+                                Value& elem = arr.arr[flat];
+                                if (elem.fields) {
+                                    auto it = elem.fields->find(flo);
+                                    if (it != elem.fields->end()) return it->second;
+                                }
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }
+            // General path: evaluate record expression, then access field
             Value rec = eval(n->record, env);
             if (rec.vtype != Value::Type::RECORD || !rec.fields)
                 throw std::runtime_error("Not a record");
@@ -1028,13 +1319,18 @@ class Interpreter {
         if (auto* n = dynamic_cast<VarNode*>(node.get())) {
             std::string lo = n->name;
             std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
-            // Zero-argument graphics functions arrive as VarNodes (no parentheses)
-            // Try graphics dispatch first for known zero-arg names
+            // Zero-argument functions that arrive as VarNodes (no parentheses)
             {
                 auto [handled, gval] = evalGraphCall(lo, {},
                     [&](const ASTPtr& n2) { return eval(n2, env); });
                 if (handled) return gval;
             }
+            // Terminal/timer zero-arg functions
+            static const std::set<std::string> zeroArgBuiltins = {
+                "keypressed","gettickcount","readkey","clrscr","donewincrt","halt","exit"
+            };
+            if (zeroArgBuiltins.count(lo))
+                return evalCall(lo, {}, env);
             // Inside a method: try env first (has up-to-date copies of self fields)
             // then fall back to selfStack for fields not yet in env
             if (!selfStack.empty()) {
@@ -1053,18 +1349,38 @@ class Interpreter {
                 }
                 throw std::runtime_error("Undefined variable: " + lo);
             }
+            // Zero-arg user function called without parens
+            if (procs.count(lo)) {
+                auto& pd = procs[lo];
+                if (pd && pd->is_function) return evalCall(lo, {}, env);
+            } else {
+            }
             return env->get(lo);
         }
 
         if (auto* n = dynamic_cast<IndexNode*>(node.get())) {
             Value arr = eval(n->array, env);
-            Value idx = eval(n->index, env);
+            // String character indexing: s[i] returns char (1-based)
+            if (arr.vtype == Value::Type::STRING) {
+                int idx = (int)eval(n->index, env).as_int() - 1;
+                if (idx >= 0 && idx < (int)arr.sval.size())
+                    return Value::from_char(arr.sval[idx]);
+                return Value::from_char('\0');
+            }
             if (arr.vtype != Value::Type::ARRAY)
                 throw std::runtime_error("Indexing non-array");
-            int i = (int)idx.as_int() - (int)arr.ival;
-            if (i < 0 || i >= (int)arr.arr.size())
+            int flat = 0;
+            if (n->indices.size() > 1 && !arr.arr_dims.empty()) {
+                int idx0 = (int)eval(n->indices[0], env).as_int() - arr.arr_dims[0].lo;
+                int idx1 = (int)eval(n->indices[1], env).as_int() - arr.arr_dims[1].lo;
+                int cols  = arr.arr_dims[1].hi - arr.arr_dims[1].lo + 1;
+                flat = idx0 * cols + idx1;
+            } else {
+                flat = (int)eval(n->index, env).as_int() - (int)arr.ival;
+            }
+            if (flat < 0 || flat >= (int)arr.arr.size())
                 throw std::runtime_error("Array index out of bounds");
-            return arr.arr[i];
+            return arr.arr[flat];
         }
 
         if (auto* n = dynamic_cast<UnaryOpNode*>(node.get())) {
@@ -1290,6 +1606,51 @@ class Interpreter {
             for (auto& a : arg_nodes) res += eval(a,env).as_string();
             return Value::from_string(res);
         }
+        if (name == "insert") {
+            // insert(source, var dest, pos) — 1-based
+            std::string ins = eval(arg_nodes[0], env).to_string();
+            if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[1].get())) {
+                std::string lo = vn->name;
+                std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                Value& dest = env->get_ref(lo);
+                std::string s = dest.to_string();
+                int p = (int)eval(arg_nodes[2], env).as_int() - 1;
+                if (p < 0) p = 0;
+                if (p > (int)s.size()) p = (int)s.size();
+                s.insert(p, ins);
+                dest = Value::from_string(s);
+            }
+            return Value{};
+        }
+        if (name == "delete") {
+            // delete(var str, pos, len) — 1-based
+            if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[0].get())) {
+                std::string lo = vn->name;
+                std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                Value& dest = env->get_ref(lo);
+                std::string s = dest.to_string();
+                int p = (int)eval(arg_nodes[1], env).as_int() - 1;
+                int l = (int)eval(arg_nodes[2], env).as_int();
+                if (p >= 0 && p < (int)s.size())
+                    s.erase(p, l);
+                dest = Value::from_string(s);
+            }
+            return Value{};
+        }
+        if (name == "gettickcount") {
+            auto now = std::chrono::steady_clock::now().time_since_epoch();
+            return Value::from_int(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+        }
+        if (name == "donewincrt") { _disable_raw_mode(); exit(0); }
+        if (name == "halt") { _disable_raw_mode(); exit(0); }
+        if (name == "exit") { throw ReturnException{}; }  // return from current procedure/function
+        if (name == "clrscr")     { _pas_clrscr(); return Value{}; }
+        if (name == "gotoxy") {
+            _pas_gotoxy((int)eval(arg_nodes[0],env).as_int(), (int)eval(arg_nodes[1],env).as_int());
+            return Value{};
+        }
+        if (name == "keypressed") { return Value::from_bool(_pas_keypressed()); }
+        if (name == "readkey")    { return Value::from_char(_pas_readkey()); }
         if (name == "random") {
             if (arg_nodes.empty()) return Value::from_real((double)rand() / RAND_MAX);
             long long n = eval(arg_nodes[0], env).as_int();
@@ -1311,16 +1672,30 @@ class Interpreter {
         if (name == "max")  { auto a=eval(arg_nodes[0],env), b=eval(arg_nodes[1],env); return a.as_real()>=b.as_real()?a:b; }
         if (name == "min")  { auto a=eval(arg_nodes[0],env), b=eval(arg_nodes[1],env); return a.as_real()<=b.as_real()?a:b; }
         if (name == "str") {
-            auto v = eval(arg_nodes[0], env);
-            // str(value, var) — assign string form to second arg
-            std::string s = v.to_string();
-            if (arg_nodes.size() > 1) {
-                if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[1].get())) {
-                    std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+            // str(value [,width], var_dest) — Turbo Pascal format
+            // Parser emits: [value, width, var] when width given, [value, var] without
+            Value v = eval(arg_nodes[0], env);
+            ASTPtr varArg;
+            long long width = 0;
+            if (arg_nodes.size() == 3) {
+                width = eval(arg_nodes[1], env).as_int();
+                varArg = arg_nodes[2];
+            } else if (arg_nodes.size() == 2) {
+                varArg = arg_nodes[1];
+            }
+            std::string s = (v.vtype == Value::Type::REAL)
+                ? [&]{ std::ostringstream o; o << v.rval; return o.str(); }()
+                : std::to_string(v.as_int());
+            if (width > 0)
+                while ((long long)s.size() < width) s = " " + s;
+            if (varArg) {
+                if (auto* vn = dynamic_cast<VarNode*>(varArg.get())) {
+                    std::string lo = vn->name;
+                    std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
                     env->set(lo, Value::from_string(s));
                 }
             }
-            return Value::from_string(s);
+            return Value{};
         }
         if (name == "val") {
             std::string s = eval(arg_nodes[0],env).as_string();
@@ -1386,7 +1761,8 @@ class Interpreter {
         }
 
         auto& pd = it->second;
-        auto call_env = std::make_shared<Environment>(global_env);
+        // Use caller's env as parent so nested procs can access outer return vars
+        auto call_env = std::make_shared<Environment>(env);
 
         // bind parameters
         for (size_t i = 0; i < pd->params.size(); i++) {
@@ -1437,25 +1813,50 @@ class Interpreter {
         if (!node) return;
 
         if (auto* n = dynamic_cast<CompoundNode*>(node.get())) {
-            for (auto& s : n->statements) exec(s, env);
+            size_t start = 0;
+            while (start < n->statements.size()) {
+                try {
+                    for (size_t i = start; i < n->statements.size(); i++)
+                        exec(n->statements[i], env);
+                    return;
+                } catch (GotoException& ge) {
+                    // Find label in this compound's statements
+                    bool found = false;
+                    for (size_t i = 0; i < n->statements.size(); i++) {
+                        auto* lbl = dynamic_cast<LabelNode*>(n->statements[i].get());
+                        if (lbl && lbl->label == ge.label) {
+                            start = i;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) throw; // propagate to outer compound
+                }
+            }
             return;
         }
         if (auto* n = dynamic_cast<AssignNode*>(node.get())) {
             Value val = eval(n->value, env);
             if (auto* idx = dynamic_cast<IndexNode*>(n->target.get())) {
-                // array element assignment
                 auto* vn = dynamic_cast<VarNode*>(idx->array.get());
                 if (!vn) throw std::runtime_error("Invalid array target");
                 std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
                 Value& arr = env->get_ref(lo);
                 if (arr.vtype != Value::Type::ARRAY) throw std::runtime_error("Not an array: " + lo);
-                int i = (int)eval(idx->index, env).as_int() - (int)arr.ival;
-                if (i < 0 || i >= (int)arr.arr.size()) throw std::runtime_error("Array index out of bounds");
-                arr.arr[i] = val;
+                int flat = 0;
+                if (idx->indices.size() > 1 && !arr.arr_dims.empty()) {
+                    int i0 = (int)eval(idx->indices[0], env).as_int() - arr.arr_dims[0].lo;
+                    int i1 = (int)eval(idx->indices[1], env).as_int() - arr.arr_dims[1].lo;
+                    int cols = arr.arr_dims[1].hi - arr.arr_dims[1].lo + 1;
+                    flat = i0 * cols + i1;
+                } else {
+                    flat = (int)eval(idx->index, env).as_int() - (int)arr.ival;
+                }
+                if (flat < 0 || flat >= (int)arr.arr.size()) throw std::runtime_error("Array index out of bounds");
+                arr.arr[flat] = val;
             } else if (auto* fa = dynamic_cast<FieldAccessNode*>(n->target.get())) {
-                // record field assignment: p.x := val
-                // Walk the chain to find the root variable, then update in place
-                // Build path: root varname + list of field names
+                // record field assignment: p.x := val  OR  t[i].x := val
+                // Walk the chain collecting field names, then find root (var or array index)
                 std::vector<std::string> path;
                 ASTNode* cur = fa;
                 while (auto* fac = dynamic_cast<FieldAccessNode*>(cur)) {
@@ -1464,15 +1865,42 @@ class Interpreter {
                     path.push_back(flo);
                     cur = fac->record.get();
                 }
-                auto* rootVar = dynamic_cast<VarNode*>(cur);
-                if (!rootVar) throw std::runtime_error("Invalid record assignment target");
-                std::string rootName = rootVar->name;
-                std::transform(rootName.begin(), rootName.end(), rootName.begin(), ::tolower);
-                // path is reversed (innermost first), reverse it
                 std::reverse(path.begin(), path.end());
-                // Get reference to root record and walk/update
-                Value& root = env->get_ref(rootName);
-                Value* rec = &root;
+
+                // Get reference to the root Value — either a plain var or an array element
+                Value* rec = nullptr;
+                if (auto* rootVar = dynamic_cast<VarNode*>(cur)) {
+                    std::string rootName = rootVar->name;
+                    std::transform(rootName.begin(), rootName.end(), rootName.begin(), ::tolower);
+                    rec = &env->get_ref(rootName);
+                } else if (auto* rootIdx = dynamic_cast<IndexNode*>(cur)) {
+                    // t[i].field — get reference to the array element
+                    auto* vn2 = dynamic_cast<VarNode*>(rootIdx->array.get());
+                    if (!vn2) throw std::runtime_error("Invalid assignment target");
+                    std::string lo2 = vn2->name;
+                    std::transform(lo2.begin(), lo2.end(), lo2.begin(), ::tolower);
+                    // Compute index BEFORE taking reference (eval may resize env map)
+                    int flat2 = 0;
+                    {
+                        Value& arr2tmp = env->get_ref(lo2);
+                        if (rootIdx->indices.size() > 1 && !arr2tmp.arr_dims.empty()) {
+                            int i0 = (int)eval(rootIdx->indices[0], env).as_int() - arr2tmp.arr_dims[0].lo;
+                            int i1 = (int)eval(rootIdx->indices[1], env).as_int() - arr2tmp.arr_dims[1].lo;
+                            flat2 = i0 * (arr2tmp.arr_dims[1].hi - arr2tmp.arr_dims[1].lo + 1) + i1;
+                        } else {
+                            flat2 = (int)eval(rootIdx->index, env).as_int() - (int)arr2tmp.ival;
+                        }
+                        if (flat2 < 0 || flat2 >= (int)arr2tmp.arr.size())
+                            throw std::runtime_error("Array index out of bounds");
+                    }
+                    // Now take stable reference (no more eval calls after this)
+                    Value& arr2 = env->get_ref(lo2);
+                    rec = &arr2.arr[flat2];
+                } else {
+                    throw std::runtime_error("Invalid record assignment target");
+                }
+
+                // Walk field path and update
                 for (size_t pi = 0; pi < path.size() - 1; pi++) {
                     if (rec->vtype != Value::Type::RECORD || !rec->fields)
                         throw std::runtime_error("Not a record: " + path[pi]);
@@ -1554,6 +1982,40 @@ class Interpreter {
             execMethodCall(n, env);
             return;
         }
+        if (auto* n = dynamic_cast<CaseNode*>(node.get())) {
+            Value v = eval(n->expr, env);
+            bool matched = false;
+            for (auto& branch : n->branches) {
+                for (auto& val : branch.values) {
+                    Value bv = eval(val, env);
+                    bool eq = false;
+                    if (v.vtype == Value::Type::CHAR && bv.vtype == Value::Type::CHAR)
+                        eq = v.cval == bv.cval;
+                    else if (v.vtype == Value::Type::STRING && bv.vtype == Value::Type::CHAR)
+                        eq = !v.sval.empty() && v.sval[0] == bv.cval;
+                    else if (v.vtype == Value::Type::CHAR && bv.vtype == Value::Type::STRING)
+                        eq = !bv.sval.empty() && bv.sval[0] == v.cval;
+                    else
+                        eq = v.as_int() == bv.as_int();
+                    if (eq) {
+                        exec(branch.body, env);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched) break;
+            }
+            if (!matched && n->else_branch)
+                exec(n->else_branch, env);
+            return;
+        }
+        if (auto* n = dynamic_cast<GotoNode*>(node.get())) {
+            throw GotoException{n->label};
+        }
+        if (auto* n = dynamic_cast<LabelNode*>(node.get())) {
+            if (n->stmt) exec(n->stmt, env);
+            return;
+        }
         if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
             evalMethodCall(n, env);
             return;
@@ -1591,7 +2053,30 @@ class Interpreter {
                         }
                         env->set_local(lo, rec);
                     } else if (vd->is_array) {
-                        env->set_local(lo, Value::make_array(vd->array_lo, vd->array_hi));
+                        auto arrVal = Value::make_array(vd->array_lo, vd->array_hi, vd->array_dims);
+                        // If element type is a record, initialize each element
+                        std::string elo = vd->type_name;
+                        std::transform(elo.begin(), elo.end(), elo.begin(), ::tolower);
+                        if (g_recordTypes.count(elo)) {
+                            for (auto& elem : arrVal.arr) {
+                                elem = Value::make_record();
+                                (*elem.fields)["__type__"] = Value::from_string(elo);
+                                for (auto& [fn, ft] : getAllFields(elo)) {
+                                    std::string flo2 = fn;
+                                    std::transform(flo2.begin(), flo2.end(), flo2.begin(), ::tolower);
+                                    std::string ftlo = ft;
+                                    std::transform(ftlo.begin(), ftlo.end(), ftlo.begin(), ::tolower);
+                                    Value fv;
+                                    if (ftlo=="integer"||ftlo=="longint"||ftlo=="shortint"||ftlo=="word"||ftlo=="byte") fv=Value::from_int(0);
+                                    else if (ftlo=="real"||ftlo=="double"||ftlo=="single") fv=Value::from_real(0.0);
+                                    else if (ftlo=="boolean") fv=Value::from_bool(false);
+                                    else if (ftlo=="char")    fv=Value::from_char('\0');
+                                    else if (ftlo=="string")  fv=Value::from_string("");
+                                    (*elem.fields)[flo2] = fv;
+                                }
+                            }
+                        }
+                        env->set_local(lo, arrVal);
                     } else {
                         std::string type = vd->type_name;
                         std::transform(type.begin(),type.end(),type.begin(),::tolower);
@@ -1734,7 +2219,7 @@ class Compiler {
     std::string cType(const std::string& pas) {
         std::string t = pas;
         std::transform(t.begin(), t.end(), t.begin(), ::tolower);
-        if (t == "integer" || t == "longint" || t == "word" || t == "byte") return "long long";
+        if (t == "integer" || t == "longint" || t == "shortint" || t == "word" || t == "byte" || t == "smallint") return "long long";
         if (t == "real" || t == "double" || t == "single")                   return "double";
         if (t == "boolean")                                                    return "int";
         if (t == "char")                                                        return "char";
@@ -2019,7 +2504,8 @@ class Compiler {
             // Zero-argument graphics functions arrive as VarNodes
             static const std::set<std::string> zeroArgGfx = {
                 "graphresult","getmaxx","getmaxy","getx","gety",
-                "getcolor","getbkcolor","readkey"
+                "getcolor","getbkcolor","readkey",
+                "keypressed","gettickcount","donewincrt","clrscr"
             };
             if (zeroArgGfx.count(lo))
                 return genCall(lo, {}, true);

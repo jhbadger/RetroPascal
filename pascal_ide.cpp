@@ -66,7 +66,8 @@ const ushort
     cmSaveFileAs  = 204,
     cmRunProgram  = 205,
     cmAbout       = 206,
-    cmGotoLine    = 207;
+    cmGotoLine    = 207,
+    cmCompileRun  = 208;
 
 // ── Run pascal interpreter ────────────────────────────────────────────────
 // Suspends tvision, runs the interpreter in the foreground (so the program
@@ -785,6 +786,7 @@ private:
     void runProgram();
     void showAbout();
     void gotoLine();
+    void compileAndRun();
     TEditorWindow* activeEditor();
 };
 
@@ -830,7 +832,8 @@ TMenuBar* TPascalIDE::initMenuBar(TRect r) {
             newLine()                                                                              +
             *new TMenuItem("~G~o to Line...", cmGotoLine,   kbNoKey)                              +
         *new TSubMenu("~R~un", kbAltR) +
-            *new TMenuItem("~R~un",           cmRunProgram, kbF9,       hcNoContext, "F9")        +
+            *new TMenuItem("~R~un",             cmRunProgram, kbF9,  hcNoContext, "F9")      +
+            *new TMenuItem("~C~ompile && Run",  cmCompileRun, kbF10, hcNoContext, "F8")      +
         *new TSubMenu("~S~earch", kbAltS) +
             *new TMenuItem("~F~ind...",        cmFind,        kbCtrlF,    hcNoContext, "Ctrl-F") +
             *new TMenuItem("~R~eplace...",     cmReplace,     kbCtrlH,    hcNoContext, "Ctrl-H") +
@@ -866,8 +869,9 @@ void TPascalIDE::handleEvent(TEvent& event) {
             case cmOpenFile:   openFile();   clearEvent(event); return;
             case cmSaveFile:   saveFile();   clearEvent(event); return;
             case cmSaveFileAs: saveFileAs(); clearEvent(event); return;
-            case cmRunProgram: runProgram(); clearEvent(event); return;
-            case cmAbout:      showAbout();  clearEvent(event); return;
+            case cmRunProgram: runProgram();    clearEvent(event); return;
+            case cmCompileRun: compileAndRun(); clearEvent(event); return;
+            case cmAbout:      showAbout();      clearEvent(event); return;
             case cmGotoLine:   gotoLine();   clearEvent(event); return;
         }
     }
@@ -911,6 +915,108 @@ void TPascalIDE::runProgram() {
         w->jumpToLine(errLine - 1);  // scroll to error line first
         w->drawView();               // redraw the whole window (triggers draw())
     }
+}
+
+void TPascalIDE::compileAndRun() {
+    auto* w = activeEditor();
+    if (!w) { messageBox(" No editor open. ", mfError | mfOKButton); return; }
+    std::string path = w->getFilePath();
+    if (path.empty()) { messageBox(" Save the file first. ", mfError | mfOKButton); return; }
+
+    // Derive binary path: strip extension
+    std::string binPath = path;
+    auto dot = binPath.rfind('.');
+    if (dot != std::string::npos) binPath = binPath.substr(0, dot);
+
+    // Step 1: compile using pascal --compile
+    w->editor->errorLine = 0;
+    TScreen::suspend();
+    printf("\n--- Compiling %s ---\n", path.c_str());
+    fflush(stdout);
+
+    std::string interp = "pascal";
+    {
+        char self[4096] = {};
+        ssize_t len = readlink("/proc/self/exe", self, sizeof(self)-1);
+        if (len > 0) {
+            std::string dir = std::string(self, len);
+            dir = dir.substr(0, dir.rfind('/') + 1);
+            std::string candidate = dir + "pascal";
+            if (access(candidate.c_str(), X_OK) == 0) interp = candidate;
+        }
+    }
+
+    // Run compiler, capturing stderr
+    int errpipe[2]; pipe(errpipe);
+    int compileOk = 0;
+    std::string errout;
+    {
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(errpipe[0]);
+            dup2(errpipe[1], STDERR_FILENO);
+            close(errpipe[1]);
+            execlp(interp.c_str(), interp.c_str(), "--compile", path.c_str(), "-o", binPath.c_str(), nullptr);
+            _exit(127);
+        } else if (pid > 0) {
+            close(errpipe[1]);
+            char buf[1024]; ssize_t n;
+            while ((n = ::read(errpipe[0], buf, sizeof(buf))) > 0) errout.append(buf, n);
+            close(errpipe[0]);
+            int status; waitpid(pid, &status, 0);
+            compileOk = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        }
+    }
+
+    if (!compileOk) {
+        fwrite(errout.c_str(), 1, errout.size(), stderr);
+        printf("\n--- Compilation FAILED. Press Enter ---");
+        fflush(stdout);
+        int c; while ((c = getchar()) != '\n' && c != EOF) {}
+        TScreen::resume();
+        TProgram::application->redraw();
+        return;
+    }
+
+    printf("OK -- running %s\n\n", binPath.c_str());
+    fflush(stdout);
+
+    // Step 2: run the compiled binary
+    int errpipe2[2]; pipe(errpipe2);
+    int exitOk = 0;
+    {
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(errpipe2[0]);
+            dup2(errpipe2[1], STDERR_FILENO);
+            close(errpipe2[1]);
+            // Resolve to absolute path so exec works regardless of cwd
+            std::string absPath = binPath;
+            if (absPath.empty() || absPath[0] != '/') {
+                char cwd[4096] = {};
+                if (getcwd(cwd, sizeof(cwd)))
+                    absPath = std::string(cwd) + "/" + absPath;
+            }
+            execv(absPath.c_str(), (char* const[]){(char*)absPath.c_str(), nullptr});
+            perror("exec");
+            _exit(127);
+        } else if (pid > 0) {
+            close(errpipe2[1]);
+            char buf[1024]; ssize_t n; errout.clear();
+            while ((n = ::read(errpipe2[0], buf, sizeof(buf))) > 0) errout.append(buf, n);
+            close(errpipe2[0]);
+            int status; waitpid(pid, &status, 0);
+            exitOk = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            if (!errout.empty()) fwrite(errout.c_str(), 1, errout.size(), stderr);
+            if (!exitOk) printf("\n[Process exited with code %d]\n", WEXITSTATUS(status));
+        }
+    }
+
+    printf("\n--- Press Enter to return to the IDE ---");
+    fflush(stdout);
+    int c; while ((c = getchar()) != '\n' && c != EOF) {}
+    TScreen::resume();
+    TProgram::application->redraw();
 }
 
 void TPascalIDE::showAbout() {

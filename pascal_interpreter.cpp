@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <variant>
+#include <unistd.h>
 #include <functional>
 #include <iomanip>
 #include <set>
@@ -1188,6 +1189,11 @@ int main(int argc, char* argv[]) {
         std::ifstream f(inputFile);
         if (!f) { std::cerr << "Cannot open file: " << inputFile << "\n"; return 1; }
         source = std::string(std::istreambuf_iterator<char>(f), {});
+    }
+    // Strip shebang line so the file can be used as a script: #!/usr/bin/env pascal
+    if (source.size() >= 2 && source[0] == '#' && source[1] == '!') {
+        auto nl = source.find('\n');
+        source = (nl == std::string::npos) ? "" : source.substr(nl + 1);
     } else if (!doCompile) {
         std::cout << "Pascal Interpreter - reading from stdin...\n";
         source = std::string(std::istreambuf_iterator<char>(std::cin), {});
@@ -2133,7 +2139,19 @@ static bool compilePascal(const std::string& source,
     Compiler compiler;
     std::string cSource = compiler.compile(ast);
 
-    std::string cFile = "/tmp/_pascal_compiled.c";
+    // Get the system temp directory ($TMPDIR on Android/Termux, /tmp elsewhere)
+    auto getTmpDir = []() -> std::string {
+        const char* t = getenv("TMPDIR");
+        if (t && *t) return std::string(t);
+        // Termux fallback
+        if (access("/data/data/com.termux/files/usr/tmp", W_OK) == 0)
+            return "/data/data/com.termux/files/usr/tmp";
+        return "/tmp";
+    };
+    std::string tmpDir = getTmpDir();
+    std::string cFile      = tmpDir + "/_pascal_compiled.c";
+    std::string errFile    = tmpDir + "/_pascal_compile_err.txt";
+    std::string debugFile  = tmpDir + "/_pascal_compiled_debug.c";
     {
         std::ofstream f(cFile);
         if (!f) { errorMsg = "Cannot write temp file"; return false; }
@@ -2172,17 +2190,17 @@ static bool compilePascal(const std::string& source,
 
     std::string cmd = "gcc -O2 -x c \"" + cFile + "\" -o \"" + outBin + "\""
                     + sdlFlags
-                    + " -lm 2>/tmp/_pascal_compile_err.txt";
+                    + " -lm 2>" + errFile;
     std::cerr << "[SDL2 flags: " << (sdlFlags.empty() ? "(none)" : sdlFlags) << "]\n";
     std::cerr << "[gcc cmd: " << cmd << "]\n";
     int ret = system(cmd.c_str());
 
     if (ret != 0) {
-        std::ifstream ef("/tmp/_pascal_compile_err.txt");
+        std::ifstream ef(errFile);
         errorMsg = std::string(std::istreambuf_iterator<char>(ef), {});
-        std::ofstream dbg("/tmp/_pascal_compiled_debug.c");
+        std::ofstream dbg(debugFile);
         dbg << cSource;
-        errorMsg += "\n[Generated C saved to /tmp/_pascal_compiled_debug.c]";
+        errorMsg += "\n[Generated C saved to " + debugFile + "]";
         return false;
     }
     return true;

@@ -997,7 +997,9 @@ void TPascalIDE::compileAndRun() {
                 if (getcwd(cwd, sizeof(cwd)))
                     absPath = std::string(cwd) + "/" + absPath;
             }
-            execv(absPath.c_str(), (char* const[]){(char*)absPath.c_str(), nullptr});
+            char* argv0 = const_cast<char*>(absPath.c_str());
+            char* execArgv[] = { argv0, nullptr };
+            execv(absPath.c_str(), execArgv);
             perror("exec");
             _exit(127);
         } else if (pid > 0) {

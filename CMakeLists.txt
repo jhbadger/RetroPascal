@@ -4,6 +4,32 @@ project(pascal_ide CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ── Build type: default to Release ────────────────────────────────────────
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type: Debug | Release | RelWithDebInfo | MinSizeRel" FORCE)
+    message(STATUS "Build type not set — defaulting to Release")
+endif()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
+# ── Optimisation & stripping flags ────────────────────────────────────────
+# Release: -O2, strip all symbols from the final binary
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    # Compiler: optimise aggressively
+    add_compile_options(-O2)
+
+    # Linker: strip debug symbols from the installed/final binary
+    if(APPLE)
+        # macOS: -dead_strip removes unused code; strip -S removes debug symbols
+        add_link_options(-Wl,-dead_strip)
+        # Post-link strip is done via CMAKE_INSTALL_STRIP (see below) or a
+        # custom command; ld on macOS doesn't accept --strip-all.
+    else()
+        # Linux / Termux: --strip-all removes all symbols
+        add_link_options(-Wl,--strip-all)
+    endif()
+endif()
+
 # ── Find or build tvision ─────────────────────────────────────────────────
 # Option A: tvision is already installed system-wide (e.g. via CMake install)
 # Option B: tvision source tree is a subdirectory or sibling directory
@@ -143,3 +169,17 @@ add_custom_command(TARGET pascal_ide POST_BUILD
 
 # ── Install ───────────────────────────────────────────────────────────────
 install(TARGETS pascal pascal_ide DESTINATION bin)
+
+# Strip installed binaries (works on all platforms via cmake --install --strip)
+set(CMAKE_INSTALL_STRIP TRUE)
+
+# On macOS, also strip the built binary in-place after linking in Release mode
+# (since ld doesn't support --strip-all, we run `strip` manually)
+if(APPLE AND (CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel"))
+    add_custom_command(TARGET pascal POST_BUILD
+        COMMAND strip -S $<TARGET_FILE:pascal>
+        COMMENT "Stripping debug symbols from pascal")
+    add_custom_command(TARGET pascal_ide POST_BUILD
+        COMMAND strip -S $<TARGET_FILE:pascal_ide>
+        COMMENT "Stripping debug symbols from pascal_ide")
+endif()

@@ -1842,6 +1842,14 @@ class Interpreter {
                 if (!vn) throw std::runtime_error("Invalid array target");
                 std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
                 Value& arr = env->get_ref(lo);
+                // String character assignment: s[i] := char (1-based)
+                if (arr.vtype == Value::Type::STRING) {
+                    int idx1 = (int)eval(idx->index, env).as_int() - 1;
+                    char ch = val.vtype == Value::Type::CHAR ? val.cval : (char)val.as_int();
+                    if (idx1 >= 0 && idx1 < (int)arr.sval.size())
+                        arr.sval[idx1] = ch;
+                    return;
+                }
                 if (arr.vtype != Value::Type::ARRAY) throw std::runtime_error("Not an array: " + lo);
                 int flat = 0;
                 if (idx->indices.size() > 1 && !arr.arr_dims.empty()) {

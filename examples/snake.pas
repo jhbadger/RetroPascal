@@ -211,26 +211,23 @@ var
 
   procedure enlarge;
   begin
+    { Add new segment at the position of the current tail end }
     slength := slength + 1;
-    for i := slength downto Count + 2 do begin
-      tx[i] := tx[i - 1];
-      ty[i] := ty[i - 1];
-    end;
-    repeat
-      ty[Count + 1] := random(13) + 2;
-      tx[Count + 1] := random(58) + 2;
-    until m[ty[Count + 1], tx[Count + 1]] = ' ';
+    tx[slength] := tx[slength - 1];
+    ty[slength] := ty[slength - 1];
   end;
 
   procedure score;
   var ns, nl: String;
     procedure conv_s(no, f: Integer; var ch: String);
+    var p: integer;
     begin
       str(no:f, ch);
-      repeat
-        insert('0', ch, pos(' ', ch));
-        delete(ch, pos(' ', ch) + 1, 1);
-      until pos(' ', ch) = 0;
+      p := pos(' ', ch);
+      while p > 0 do begin
+        ch[p] := '0';
+        p := pos(' ', ch);
+      end;
     end;
   begin
     s := s + nr + 1;

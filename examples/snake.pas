@@ -1,5 +1,7 @@
 program Snake_Game;
 
+{ Adapted from https://github.com/Crymfox/pascal-games-collection}
+
 { Arrow key codes returned by readkey as single chars }
 const
   KEY_UP    = #1;

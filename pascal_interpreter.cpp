@@ -2255,8 +2255,8 @@ class Compiler {
 
     std::string ind() { return std::string(indent * 4, ' '); }
 
-    void emit(const std::string& s) { out << s; }
-    void emitln(const std::string& s = "") { out << s << "\n"; }
+    void emit(const std::string& s) {        out << s; }
+    void emitln(const std::string& s = "") {        out << s << "\n"; }
     void emitind(const std::string& s) { out << ind() << s << "\n"; }
 
     // ── Expression codegen ────────────────────
@@ -2423,10 +2423,17 @@ class Compiler {
         if (auto* n = dynamic_cast<BoolNode*>(node.get()))
             return n->value ? "1" : "0";
         if (auto* n = dynamic_cast<CharNode*>(node.get())) {
-            std::string s = "'"; 
-            if (n->value == '\'') s += "\\'";
-            else if (n->value == '\\') s += "\\\\";
-            else s += n->value;
+            char cv = n->value;
+            std::string s = "'";
+            if      (cv == '\'') s += "\\'";
+            else if (cv == '\\') s += "\\\\";
+            else if (cv == '\r') s += "\\r";
+            else if (cv == '\n') s += "\\n";
+            else if (cv == '\t') s += "\\t";
+            else if (cv == '\0') s += "\\0";
+            else if ((unsigned char)cv < 32 || (unsigned char)cv == 127)
+                { char buf[8]; snprintf(buf, sizeof(buf), "\\x%02x", (unsigned char)cv); s += buf; }
+            else s += cv;
             s += "'";
             return s;
         }
@@ -2517,12 +2524,53 @@ class Compiler {
             };
             if (zeroArgGfx.count(lo))
                 return genCall(lo, {}, true);
+            // Zero-arg user function called without parens (e.g. while do_main_menu do)
+            if (userProcs.count(lo)) {
+                auto pit = allProcs.find(lo);
+                if (pit != allProcs.end() && pit->second->is_function && pit->second->params.empty())
+                    return "pas_" + lo + "()";
+            }
             return safeId(n->name);
         }
         if (auto* n = dynamic_cast<IndexNode*>(node.get())) {
             auto* vn = dynamic_cast<VarNode*>(n->array.get());
-            if (!vn) return "/*bad index*/0";
+            if (!vn) {
+                // Chained index: e.g. Name[i][k] — inner result is a string, outer is char access
+                // Generate inner expression then index into it as a char array
+                auto* innerIdx = dynamic_cast<IndexNode*>(n->array.get());
+                if (innerIdx) {
+                    std::string inner = genExpr(n->array); // e.g. pas_name[i - pas_name_lo]
+                    std::string idx2  = genExpr(n->index);
+                    // inner[k-1] gives the char; wrap as (char[]){ch, 0} for string param context
+                    return "(char[]){" + inner + "[" + idx2 + " - 1], 0}";
+                }
+                return "/*bad index*/0";
+            }
             std::string base = safeId(vn->name);
+            if (n->indices.size() > 1) {
+                // 2D array: m[row, col] -> m[(row-lo0)*cols + (col-lo1)]
+                // We need the dimension info from varTypes or g_recordTypes
+                // Use lo vars: base_lo0, base_lo1 — but we only emit base_lo
+                // Simple approach: look up dims from global VarDecl info
+                // For now encode as (row-lo)*cols + (col-lo) where cols is known at compile time
+                // We store dim info in a map during genDecl
+                std::string row = genExpr(n->indices[0]);
+                std::string col = genExpr(n->indices[1]);
+                // Look up in arrayDims map
+                std::string loname = base;
+                std::transform(loname.begin(), loname.end(), loname.begin(), ::tolower);
+                // Remove pas_ prefix for lookup
+                std::string bareBase = loname.substr(4); // strip "pas_"
+                auto dit = arrayDims.find(bareBase);
+                if (dit != arrayDims.end() && dit->second.size() >= 2) {
+                    int lo0 = dit->second[0].lo, lo1 = dit->second[1].lo;
+                    int cols = dit->second[1].hi - dit->second[1].lo + 1;
+                    return base + "[(" + row + " - " + std::to_string(lo0) + ") * " +
+                           std::to_string(cols) + " + (" + col + " - " + std::to_string(lo1) + ")]";
+                }
+                // Fallback
+                return base + "[" + row + " - " + base + "_lo]";
+            }
             std::string idx  = genExpr(n->index);
             return base + "[" + idx + " - " + base + "_lo]";
         }
@@ -2571,6 +2619,17 @@ class Compiler {
             if (n->op == ">")   return "(" + l + " > "  + r + ")";
             if (n->op == ">=")  return "(" + l + " >= " + r + ")";
         }
+        if (auto* n = dynamic_cast<SetMemberNode*>(node.get())) {
+            // expr in [a, b, c]  ->  (expr==a || expr==b || expr==c)
+            std::string lhs = genExpr(n->expr);
+            if (n->elements.empty()) return "0";
+            std::string result = "(";
+            for (size_t si = 0; si < n->elements.size(); si++) {
+                if (si) result += " || ";
+                result += "(" + lhs + " == " + genExpr(n->elements[si]) + ")";
+            }
+            return result + ")";
+        }
         if (auto* n = dynamic_cast<CallNode*>(node.get()))
             return genCall(n->name, n->args, true);
         return "0/*?*/";
@@ -2583,12 +2642,66 @@ class Compiler {
 
         // If the user defined a proc/func with this name, skip built-in/graphics handling
         // and go straight to user-defined call
-        if (userProcs.count(name)) {
-            std::string call = safeId(raw) + "(";
+        if (userProcs.count(name) || nestedCallNames.count(name)) {
+            // Find the ProcDef to get param types for char->string promotion
+            ProcDef* pd2 = nullptr;
+            auto allIt = allProcs.find(name);
+            if (allIt != allProcs.end()) pd2 = allIt->second;
+            // Use mangled name if this is a nested proc call
+            std::string callName = nestedCallNames.count(name) ? nestedCallNames.at(name) : safeId(raw);
+            bool isNested = nestedCallNames.count(name) > 0;
+            std::string call = callName + "(";
             for (size_t i = 0; i < args.size(); i++) {
                 if (i) call += ", ";
+                // Promote char literal to char* when param expects string
+                bool needStr = false;
+                if (pd2 && i < pd2->params.size()) {
+                    std::string pt = pd2->params[i].type;
+                    std::transform(pt.begin(),pt.end(),pt.begin(),::tolower);
+                    needStr = (pt == "string");
+                }
+                if (needStr) {
+                    if (auto* cn = dynamic_cast<CharNode*>(args[i].get())) {
+                        char cv = cn->value;
+                        char buf[32];
+                        if (cv == '\'')      snprintf(buf,sizeof(buf),"(char[]){'\\'', 0}");
+                        else if (cv == '\\') snprintf(buf,sizeof(buf),"(char[]){'\\\\', 0}");
+                        else                 snprintf(buf,sizeof(buf),"(char[]){'%c', 0}",cv);
+                        call += buf;
+                        continue;
+                    }
+                    // char variable passed to string param: wrap as (char[]){var, 0}
+                    if (auto* vn2 = dynamic_cast<VarNode*>(args[i].get())) {
+                        std::string vlo2 = vn2->name;
+                        std::transform(vlo2.begin(),vlo2.end(),vlo2.begin(),::tolower);
+                        auto vit = varTypes.find(vlo2);
+                        if (vit == varTypes.end()) vit = varTypes.find("self."+vlo2);
+                        if (vit != varTypes.end()) {
+                            std::string vt = vit->second;
+                            std::transform(vt.begin(),vt.end(),vt.begin(),::tolower);
+                            if (vt == "char") {
+                                call += "(char[]){" + genExpr(args[i]) + ", 0}";
+                                continue;
+                            }
+                        }
+                    }
+                }
                 call += genExpr(args[i]);
             }
+            // Pass _outer_ret_ to nested procs
+            if (isNested) {
+                if (!args.empty()) call += ", ";
+                // Pass current _ret_ pointer if we're in a function, else NULL
+                if (!currentFunc.empty()) call += "&_ret_";
+                else call += "NULL";
+            }
+            return call + ")";
+        }
+
+        // Check nested procs not in userProcs (they are local to parent)
+        if (nestedCallNames.count(name)) {
+            std::string call = nestedCallNames.at(name) + "(";
+            for (size_t i = 0; i < args.size(); i++) { if(i) call+=", "; call+=genExpr(args[i]); }
             return call + ")";
         }
 
@@ -2630,8 +2743,24 @@ class Compiler {
         if (name == "upcase")    return "toupper((unsigned char)(" + a(0) + "))";
         if (name == "lowercase") return "tolower((unsigned char)(" + a(0) + "))";
         if (name == "pos") {
-            return "(strstr(" + a(1) + ", " + a(0) + ") ? "
-                   "(long long)(strstr(" + a(1) + ", " + a(0) + ") - (" + a(1) + ")) + 1 : 0LL)";
+            // pos(needle, haystack) -> 1-based index or 0
+            // needle may be a char literal — wrap it as a string
+            std::string needle = genExpr(args[0]);
+            std::string hay    = genExpr(args[1]);
+            // If needle is a char literal (single-quoted), make it a string for strstr
+            if (!needle.empty() && needle.front() == '\'')
+                needle = "(char[]){" + needle + ", 0}";
+            return "(strstr(" + hay + ", " + needle + ") ? "
+                   "(long long)(strstr(" + hay + ", " + needle + ") - (" + hay + ")) + 1LL : 0LL)";
+        }
+        if (name == "str") {
+            // str(value, width, var) — write formatted int to char buffer
+            // args: [value, width, varptr] — varptr is passed by ref
+            std::string val  = genExpr(args[0]);
+            std::string wid  = (args.size() > 2) ? genExpr(args[1]) : "0LL";
+            std::string dest = (args.size() > 2) ? genExpr(args[2]) : genExpr(args[1]);
+            emitind("pas_str((long long)(" + val + "), " + wid + ", " + dest + ");");
+            return "";
         }
         if (name == "copy") {
             // Emit as a runtime helper call
@@ -2706,13 +2835,65 @@ class Compiler {
             return;
         }
         if (auto* n = dynamic_cast<AssignNode*>(node.get())) {
-            // Check for array element assignment
+            std::string rhs = genExpr(n->value);
+            // Array / string element assignment
             if (auto* idx = dynamic_cast<IndexNode*>(n->target.get())) {
                 auto* vn = dynamic_cast<VarNode*>(idx->array.get());
+                if (!vn) { emitind("/* bad index target */"); return; }
                 std::string base = safeId(vn->name);
-                std::string i    = genExpr(idx->index);
-                std::string val  = genExpr(n->value);
-                emitind(base + "[" + i + " - " + base + "_lo] = " + val + ";");
+                // Check array element type and variable type
+                std::string vnlo = vn->name; std::transform(vnlo.begin(),vnlo.end(),vnlo.begin(),::tolower);
+                // Check if it's an array-of-string element: Name[i] := str
+                auto aeit = arrayElemType.find(vnlo);
+                if (aeit != arrayElemType.end()) {
+                    std::string et = aeit->second; std::transform(et.begin(),et.end(),et.begin(),::tolower);
+                    if (et == "string") {
+                        // strncpy(Name[i-1], rhs, 1023)
+                        emitind("strncpy(" + base + "[" + genExpr(idx->index) + " - " + base + "_lo], " + rhs + ", 1023);");
+                        return;
+                    }
+                }
+                // String character assignment: s[i] := char -> s[i-1] = char
+                auto vtit = varTypes.find(vnlo);
+                if (vtit != varTypes.end()) {
+                    std::string vt = vtit->second; std::transform(vt.begin(),vt.end(),vt.begin(),::tolower);
+                    if (vt == "string") {
+                        emitind(base + "[" + genExpr(idx->index) + " - 1] = (char)(" + rhs + ");");
+                        return;
+                    }
+                }
+                // 2D array
+                if (idx->indices.size() > 1) {
+                    auto dit2 = arrayDims.find(vnlo);
+                    if (dit2 != arrayDims.end() && dit2->second.size() >= 2) {
+                        int lo0 = dit2->second[0].lo, lo1 = dit2->second[1].lo;
+                        int cols = dit2->second[1].hi - dit2->second[1].lo + 1;
+                        std::string row = genExpr(idx->indices[0]);
+                        std::string col = genExpr(idx->indices[1]);
+                        emitind(base + "[(" + row + " - " + std::to_string(lo0) + ") * " +
+                               std::to_string(cols) + " + (" + col + " - " + std::to_string(lo1) + ")] = " + rhs + ";");
+                        return;
+                    }
+                }
+                // 1D array
+                std::string idx1 = genExpr(idx->index);
+                // If element type is string, use strncpy
+                {
+                    std::string elo2 = "";
+                    auto evit = varTypes.find(vnlo);
+                    // Look up array element type — stored as type name in varTypes... not directly.
+                    // Check if rhs is a string literal: use strncpy
+                    bool rhsIsStrLit = dynamic_cast<StringNode*>(n->value.get()) != nullptr;
+                    if (rhsIsStrLit) {
+                        // Check if this is a char array (single char element)
+                        // or string array (char* element) — check rhs length
+                        // For safety, use strncpy for multi-char string literals
+                        std::string el_expr = base + "[" + idx1 + " - " + base + "_lo]";
+                        emitind("strncpy(" + el_expr + ", " + rhs + ", 1023);");
+                    } else {
+                        emitind(base + "[" + idx1 + " - " + base + "_lo] = " + rhs + ";");
+                    }
+                }
             } else if (dynamic_cast<FieldAccessNode*>(n->target.get())) {
                 // Record field assignment
                 std::string lhs = genExpr(n->target);
@@ -2742,6 +2923,15 @@ class Compiler {
                 std::string cf = currentFunc;
                 std::transform(cf.begin(), cf.end(), cf.begin(), ::tolower);
                 std::string lhs;
+                // Check if assigning to outer function return variable
+                bool isOuterRet = false;
+                for (auto& ofn : outerFuncRetNames) {
+                    if (!ofn.empty() && vlo == ofn && vlo != cf) { isOuterRet = true; break; }
+                }
+                if (isOuterRet) {
+                    emitind("if (_outer_ret_) *((int*)_outer_ret_) = (int)(" + rhs + ");");
+                    return;
+                }
                 // Compute short function name (strip type prefix for methods)
                 std::string lhsCf = currentFunc;
                 std::transform(lhsCf.begin(), lhsCf.end(), lhsCf.begin(), ::tolower);
@@ -2750,7 +2940,7 @@ class Compiler {
                 if (!currentFunc.empty() && (vlo == lhsCf || vlo == lhsShortCf))
                     lhs = "_ret_";
                 else if (!currentMethodType.empty() && varTypes.count("self." + vlo) && !varTypes.count(vlo) && vlo != lhsShortCf)
-                    lhs = "self->pas_" + vlo;  // field assignment in method
+                    lhs = "self->pas_" + vlo;
                 else
                     lhs = safeId(vn->name);
                 // String assignments need strncpy
@@ -2847,6 +3037,36 @@ class Compiler {
             emitind("} while (!(" + genExpr(n->cond) + "));");
             return;
         }
+        if (auto* n = dynamic_cast<CaseNode*>(node.get())) {
+            // case expr of val1: stmt; val2: stmt; ... [otherwise stmt] end
+            std::string expr = genExpr(n->expr);
+            bool first = true;
+            for (auto& branch : n->branches) {
+                std::string cond;
+                for (size_t vi = 0; vi < branch.values.size(); vi++) {
+                    if (vi) cond += " || ";
+                    cond += "(" + expr + " == " + genExpr(branch.values[vi]) + ")";
+                }
+                emitind((first ? "if (" : "} else if (") + cond + ") {");
+                first = false;
+                indent++;
+                auto* cb = dynamic_cast<CompoundNode*>(branch.body.get());
+                if (cb) { for (auto& s : cb->statements) genStmt(s); }
+                else genStmt(branch.body);
+                indent--;
+            }
+            if (n->else_branch) {
+                emitind("} else {");
+                indent++;
+                auto* eb = dynamic_cast<CompoundNode*>(n->else_branch.get());
+                if (eb) { for (auto& s : eb->statements) genStmt(s); }
+                else genStmt(n->else_branch);
+                indent--;
+            }
+            if (!n->branches.empty() || n->else_branch)
+                emitind("}");
+            return;
+        }
         if (auto* n = dynamic_cast<WriteNode*>(node.get())) {
             for (auto& arg : n->args) {
                 std::string e = genExpr(arg);
@@ -2936,15 +3156,39 @@ class Compiler {
                         emitind("PAS_PRINT(" + e + ");");
                     }
                 } else {
-                    // BinOp, CallNode, or other expression
-                    // Use isRealExpr to decide format
-                    if (isRealExpr(arg))
+                    // BinOp, IndexNode, CallNode, or other expression
+                    // Check if it's a char array element
+                    bool isCharElem = false;
+                    if (auto* idx = dynamic_cast<IndexNode*>(arg.get())) {
+                        if (auto* vn2 = dynamic_cast<VarNode*>(idx->array.get())) {
+                            std::string vlo2 = vn2->name;
+                            std::transform(vlo2.begin(),vlo2.end(),vlo2.begin(),::tolower);
+                            // Check arrayElemType first
+                            auto aeit2 = arrayElemType.find(vlo2);
+                            if (aeit2 != arrayElemType.end()) {
+                                std::string et2 = aeit2->second;
+                                std::transform(et2.begin(),et2.end(),et2.begin(),::tolower);
+                                if (et2 == "char") isCharElem = true;
+                            } else {
+                                // Fall back to varTypes
+                                auto vit2 = varTypes.find(vlo2);
+                                if (vit2 != varTypes.end()) {
+                                    std::string vt2 = vit2->second;
+                                    std::transform(vt2.begin(),vt2.end(),vt2.begin(),::tolower);
+                                    if (vt2 == "char") isCharElem = true;
+                                }
+                            }
+                        }
+                    }
+                    if (isCharElem)
+                        emitind("pas_print_c((char)(" + e + "));");
+                    else if (isRealExpr(arg))
                         emitind("pas_print_d((double)(" + e + "));");
                     else
                         emitind("pas_print_ll((long long)(" + e + "));");
                 }
             }
-            if (n->newline) emitind("printf(\"\\n\");");
+            if (n->newline) emitind("write(1,\"\\n\",1);");
             return;
         }
         if (auto* n = dynamic_cast<ReadNode*>(node.get())) {
@@ -2977,7 +3221,38 @@ class Compiler {
             std::transform(name.begin(), name.end(), name.begin(), ::tolower);
             if (name == "randomize") { emitind("srand((unsigned)time(NULL));"); return; }
             if (name == "halt") { emitind("exit(0);"); return; }
-            emitind(genCall(n->name, n->args, false) + ";");
+            if (name == "exit") { // Pascal exit = return from current function
+                if (!currentFunc.empty()) emitind("return _ret_;");
+                else emitind("return;");
+                return;
+            }
+            if (name == "clrscr")   { emitind("pas_clrscr();"); return; }
+            if (name == "gotoxy")   { emitind("pas_gotoxy(" + genExpr(n->args[0]) + ", " + genExpr(n->args[1]) + ");"); return; }
+            if (name == "donewincrt"){ emitind("exit(0);"); return; }
+            if (name == "str") {
+                // str(val, width, dest) or str(val, dest)
+                std::string val  = genExpr(n->args[0]);
+                std::string wid  = (n->args.size() > 2) ? genExpr(n->args[1]) : "0LL";
+                std::string dest = (n->args.size() > 2) ? genExpr(n->args[2]) : genExpr(n->args[1]);
+                emitind("pas_str((long long)(" + val + "), " + wid + ", " + dest + ");");
+                return;
+            }
+            if (name == "insert") {
+                // insert(src, dest, pos)
+                emitind("{ char* _ins=" + genExpr(n->args[0]) + "; char* _dst=" + genExpr(n->args[1]) +
+                        "; int _p=(int)(" + genExpr(n->args[2]) + ")-1; int _dl=strlen(_dst), _sl=strlen(_ins);"
+                        " if(_p>=0&&_p<=_dl&&_dl+_sl<1023){memmove(_dst+_p+_sl,_dst+_p,_dl-_p+1);memcpy(_dst+_p,_ins,_sl);} }");
+                return;
+            }
+            if (name == "delete") {
+                // delete(dest, pos, len)
+                emitind("{ char* _dst=" + genExpr(n->args[0]) + "; int _p=(int)(" + genExpr(n->args[1]) +
+                        ")-1, _l=(int)(" + genExpr(n->args[2]) + "); int _dl=strlen(_dst);"
+                        " if(_p>=0&&_p<_dl){memmove(_dst+_p,_dst+_p+_l,_dl-_p-_l+1);} }");
+                return;
+            }
+            std::string result = genCall(n->name, n->args, false);
+            if (!result.empty()) emitind(result + ";");
             return;
         }
     }
@@ -3006,6 +3281,12 @@ class Compiler {
     std::set<std::string> emittedStructs; // avoid duplicate struct defs
     std::set<std::string> globalVarNames;  // names of global variables
     std::vector<std::pair<std::string,std::string>> globalObjVars; // (id, typeName)
+    std::map<std::string, std::vector<ArrayDim>> arrayDims; // var name -> dims for multi-dim arrays
+    std::map<std::string, std::string> arrayElemType; // var name -> element type
+    std::map<std::string, ProcDef*> allProcs; // all procs for param type lookup
+    std::string nestedPrefix; // prefix for lifted nested proc names
+    std::map<std::string,std::string> nestedCallNames; // short name -> mangled name for current scope
+    std::vector<std::string> outerFuncRetNames; // stack of outer function return var names
 
     void genDecl(const ASTPtr& node, bool global) {
         if (auto* vd = dynamic_cast<VarDecl*>(node.get())) {
@@ -3026,8 +3307,19 @@ class Compiler {
                     if (global) globalObjVars.push_back({id, tlo});
                 } else if (vd->is_array) {
                     int sz = vd->array_hi - vd->array_lo + 1;
-                    emitind(cType(vd->type_name) + " " + id + "[" + std::to_string(sz) + "];");
+                    std::string elemCT = cType(vd->type_name);
+                    // array of string: char name[N][1024]
+                    std::string etlo = vd->type_name;
+                    std::transform(etlo.begin(), etlo.end(), etlo.begin(), ::tolower);
+                    if (etlo == "string")
+                        emitind("char " + id + "[" + std::to_string(sz) + "][1024];");
+                    else
+                        emitind(elemCT + " " + id + "[" + std::to_string(sz) + "];");
                     emitind("const int " + id + "_lo = " + std::to_string(vd->array_lo) + ";");
+                    // Store dimension and element type info
+                    std::string bareId = id.substr(4); // strip "pas_"
+                    if (!vd->array_dims.empty()) arrayDims[bareId] = vd->array_dims;
+                    arrayElemType[bareId] = vd->type_name;
                 } else {
                     std::string ct = cType(vd->type_name);
                     if (ct == "char*")
@@ -3069,7 +3361,9 @@ class Compiler {
         for (size_t i = 0; i < pd->params.size(); i++) {
             if (i) sig += ", ";
             std::string ct = cType(pd->params[i].type);
-            if (pd->params[i].by_ref) ct += "*";
+            std::string ptfwd = pd->params[i].type;
+            std::transform(ptfwd.begin(),ptfwd.end(),ptfwd.begin(),::tolower);
+            if (pd->params[i].by_ref && ptfwd != "string") ct += "*";
             sig += ct + " " + safeId(pd->params[i].name);
         }
         sig += ");";
@@ -3115,8 +3409,11 @@ class Compiler {
                 methodTypeName = lo.substr(0, dot);
                 methodFuncName = lo.substr(dot + 1);
                 procName = methodTypeName + "_" + methodFuncName;
+            } else if (!nestedPrefix.empty()) {
+                // Nested proc — mangle: parentname__childname
+                procName = nestedPrefix + "__" + lo;
             } else {
-                procName = lo;  // lowercase to match calls
+                procName = lo;
             }
         }
         currentMethodType = methodTypeName; // set so genExpr emits self->field
@@ -3140,35 +3437,69 @@ class Compiler {
             if (i && methodTypeName.empty()) sig += ", ";
             else if (i) sig += ", ";
             std::string ct = cType(pd->params[i].type);
-            if (pd->params[i].by_ref) ct += "*";
+            std::string ptdef = pd->params[i].type;
+            std::transform(ptdef.begin(), ptdef.end(), ptdef.begin(), ::tolower);
+            // String vars passed by ref are already char* (array), no extra *
+            if (pd->params[i].by_ref && ptdef != "string") ct += "*";
             sig += ct + " " + safeId(pd->params[i].name);
         }
+        // If this is a nested proc (has a prefix), add hidden _outer_ret_ param
+        if (!nestedPrefix.empty() && procName.find("__") != std::string::npos)
+            sig += (sig.back() == '(' ? std::string("") : std::string(", ")) + "void* _outer_ret_";
         sig += ")";
-        emitind(sig);
-        emitind("{");
-        indent++;
 
-        // Return variable for functions — use _ret_ to avoid shadowing function name
+        // Emit nested proc/func definitions BEFORE this function (C doesn't allow nesting)
+        std::string savedPrefix = nestedPrefix;
+        auto savedNestedCallNames = nestedCallNames;
+        // Track outer return var for nested proc assignment resolution
         if (pd->is_function) {
-            std::string rt = cType(pd->return_type);
-            if (rt == "char*")
-                emitind("static char _ret_[1024] = \"\";");  // static avoids dangling pointer
-            else
-                emitind(rt + " _ret_ = 0;");
+            std::string fnlo = pd->name; std::transform(fnlo.begin(),fnlo.end(),fnlo.begin(),::tolower);
+            outerFuncRetNames.push_back(fnlo);
+        } else {
+            outerFuncRetNames.push_back("");
         }
-
-        // Local declarations
+        if (!methodTypeName.empty())
+            nestedPrefix = methodTypeName + "_" + methodFuncName;
+        else {
+            // Accumulate prefix for deeply nested procs (grandparent__parent)
+            // procName is already mangled at this point
+            nestedPrefix = procName;
+        }
+        // Register nested proc names so calls get mangled
         for (auto& d : pd->decls) {
-            if (!dynamic_cast<ProcDef*>(d.get()))
-                genDecl(d, false);
+            if (auto* npd = dynamic_cast<ProcDef*>(d.get())) {
+                std::string nlo = npd->name;
+                std::transform(nlo.begin(), nlo.end(), nlo.begin(), ::tolower);
+                nestedCallNames[nlo] = "pas_" + nestedPrefix + "__" + nlo;
+            }
         }
-        // Nested proc/func definitions
         for (auto& d : pd->decls) {
             if (dynamic_cast<ProcDef*>(d.get()))
                 genProcDef(d);
         }
+        outerFuncRetNames.pop_back();
+        // Note: nestedPrefix and nestedCallNames restored AFTER body emission below
 
-        // Body
+        emitind(sig);
+        emitind("{");
+        indent++;
+
+        // Return variable for functions
+        if (pd->is_function) {
+            std::string rt = cType(pd->return_type);
+            if (rt == "char*")
+                emitind("static char _ret_[1024] = \"\";");
+            else
+                emitind(rt + " _ret_ = 0;");
+        }
+
+        // Local variable declarations only (nested procs already emitted above)
+        for (auto& d : pd->decls) {
+            if (!dynamic_cast<ProcDef*>(d.get()))
+                genDecl(d, false);
+        }
+
+        // Body — emitted while nestedCallNames still active so calls get mangled
         if (pd->body) {
             auto* compound = dynamic_cast<CompoundNode*>(pd->body.get());
             if (compound) {
@@ -3184,6 +3515,10 @@ class Compiler {
         indent--;
         emitind("}");
         emitln();
+
+        // Now restore saved context
+        nestedPrefix = savedPrefix;
+        nestedCallNames = savedNestedCallNames;
         currentFunc = prevFunc;
         currentMethodType = "";
         // Restore any globals that were shadowed by params
@@ -3192,9 +3527,50 @@ class Compiler {
     }
 
 public:
+    bool usesGraphics = false;
+
     std::string compile(const ASTPtr& ast) {
         auto* prog = dynamic_cast<ProgramNode*>(ast.get());
         if (!prog) throw std::runtime_error("Not a program node");
+
+        // Detect if program uses graphics functions by scanning all procedures
+        {
+            static const std::set<std::string> gfxFuncs = {
+                "initgraph","line","lineto","circle","bar","arc","ellipse",
+                "fillellipse","floodfill","setcolor","cleardevice","closegraph",
+                "putpixel","drawpoly","fillpoly","setbkcolor","rectangle"
+            };
+            std::function<void(const std::vector<ASTPtr>&)> scanDecls;
+            std::function<void(const ASTPtr&)> scanNode = [&](const ASTPtr& n) {
+                if (!n) return;
+                if (auto* c = dynamic_cast<CallNode*>(n.get())) {
+                    std::string lo = c->name;
+                    std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+                    if (gfxFuncs.count(lo)) usesGraphics = true;
+                    for (auto& a : c->args) scanNode(a);
+                } else if (auto* blk = dynamic_cast<CompoundNode*>(n.get())) {
+                    for (auto& s : blk->statements) scanNode(s);
+                } else if (auto* wh = dynamic_cast<WhileNode*>(n.get())) {
+                    scanNode(wh->cond); scanNode(wh->body);
+                } else if (auto* fi = dynamic_cast<IfNode*>(n.get())) {
+                    scanNode(fi->cond); scanNode(fi->then_branch); scanNode(fi->else_branch);
+                } else if (auto* fo = dynamic_cast<ForNode*>(n.get())) {
+                    scanNode(fo->body);
+                } else if (auto* re = dynamic_cast<RepeatNode*>(n.get())) {
+                    scanNode(re->body);
+                } else if (auto* pd = dynamic_cast<ProcDef*>(n.get())) {
+                    scanDecls(pd->decls);
+                    scanNode(pd->body);
+                } else if (auto* as = dynamic_cast<AssignNode*>(n.get())) {
+                    scanNode(as->value);
+                }
+            };
+            scanDecls = [&](const std::vector<ASTPtr>& decls) {
+                for (auto& d : decls) scanNode(d);
+            };
+            scanDecls(prog->declarations);
+            scanNode(prog->body);
+        }
 
         // Collect user-defined proc/func names to avoid stub conflicts
         std::set<std::string> userProcs;
@@ -3230,14 +3606,19 @@ public:
         emitln("#include <stdio.h>");
         emitln("#include <stdlib.h>");
         emitln("#include <string.h>");
+emitln("#include <time.h>");
+emitln("#include <sys/select.h>");
         emitln("#include <math.h>");
         emitln("#include <time.h>");
         emitln("#include <ctype.h>");
         emitln("#include <stdarg.h>");
 emitln("#include <string.h>");
+emitln("#include <time.h>");
+emitln("#include <sys/select.h>");
         emitln();
 
-        // Graphics — full SDL2 implementation inline, or stubs if no SDL2
+        // Graphics — full SDL2 implementation inline, only when program uses graphics
+        if (usesGraphics) {
         emitln("#ifdef HAVE_SDL2");
         emitln("#include <SDL.h>");
         emitln("#include <math.h>");
@@ -3284,6 +3665,11 @@ emitln("#include <string.h>");
         emitln("{0,0,198,108,56,108,198,0},{0,0,204,204,204,124,12,248},{0,0,252,152,48,100,252,0},");
         emitln("{28,48,48,224,48,48,28,0},{24,24,24,0,24,24,24,0},{224,48,48,28,48,48,224,0},{118,220,0,0,0,0,0,0},{0,0,0,0,0,0,0,0}};");
         emitln("static void _pump(void){SDL_Event e;while(SDL_PollEvent(&e)){}}");
+        // SDL keypressed uses SDL event system
+        if (!userProcs.count("keypressed"))
+            emitln("static int pas_keypressed(void){SDL_PumpEvents();return SDL_HasEvent(SDL_KEYDOWN);}");
+        // NOTE: gotoxy and clrscr are NOT defined here — they are defined after the #endif
+        // so they work correctly for both SDL and non-SDL builds
         emitln("static void _flush(void){");
         emitln("  if(!_gfx.t)return;");
         emitln("  SDL_UpdateTexture(_gfx.t,NULL,_gfx.px,_gfx.W*4);");
@@ -3426,8 +3812,6 @@ emitln("#include <string.h>");
         emitStub("gety",         "static inline int  pas_gety(void){ return 0; }");
         emitStub("getcolor",     "static inline int  pas_getcolor(void){ return 15; }");
         emitStub("getbkcolor",   "static inline int  pas_getbkcolor(void){ return 0; }");
-        emitStub("readkey",      "static inline char pas_readkey(void){ return getchar(); }");
-        emitStub("delay",        "static inline void pas_delay(long long ms){ (void)ms; }");
         emitStub("putpixel",     "static inline void pas_putpixel(long long x,long long y,long long c){(void)x;(void)y;(void)c;}");
         emitStub("getpixel",     "static inline long long pas_getpixel(long long x,long long y){(void)x;(void)y;return 0;}");
         emitStub("line",         "static inline void pas_line(long long x1,long long y1,long long x2,long long y2){(void)x1;(void)y1;(void)x2;(void)y2;}");
@@ -3452,14 +3836,44 @@ emitln("#include <string.h>");
         emitStub("textwidth",    "static inline long long pas_textwidth(char*s){return (long long)strlen(s)*8;}");
         emitStub("textheight",   "static inline long long pas_textheight(char*s){(void)s;return 8;}");
         emitln("#endif");
+        } // end if (usesGraphics)
+        emitln();
+
+        // ── Terminal stubs — outside #ifdef so they work with or without SDL2 ──
+        // Raw terminal mode helpers (used by readkey and keypressed)
+        if (!userProcs.count("readkey") || !userProcs.count("keypressed")) {
+            emitln(R"(
+#include <termios.h>
+#include <unistd.h>
+#ifndef _PAS_RAW_DEFINED
+#define _PAS_RAW_DEFINED
+static struct termios _pas_orig_tio;
+static int _pas_raw_mode = 0;
+static void _pas_restore_tio(void) { if(_pas_raw_mode){tcsetattr(0,0,&_pas_orig_tio);_pas_raw_mode=0;} }
+static void _pas_set_raw(void) { if(_pas_raw_mode) return; tcgetattr(0,&_pas_orig_tio); atexit(_pas_restore_tio); struct termios t=_pas_orig_tio; t.c_lflag&=~(ECHO|ICANON); t.c_cc[VMIN]=1; t.c_cc[VTIME]=0; tcsetattr(0,0,&t); _pas_raw_mode=1; }
+#endif
+)");
+        }
+        if (!userProcs.count("readkey")) {
+            emitln(R"(static char pas_readkey(void) { _pas_set_raw(); char ch; if(read(0,&ch,1)!=1)return 0; if(ch==27){ struct timeval tv={0,50000}; fd_set f; FD_ZERO(&f); FD_SET(0,&f); char s[2]={0}; if(select(1,&f,0,0,&tv)>0&&read(0,s,1)==1&&s[0]=='['){ if(select(1,&f,0,0,&tv)>0&&read(0,s+1,1)==1){ if(s[1]=='A')return 1; if(s[1]=='B')return 2; if(s[1]=='C')return 4; if(s[1]=='D')return 3; } } return 27; } if(ch==10)ch=13; return ch; })");
+        }
+        if (!userProcs.count("keypressed"))
+            emitln("static inline int pas_keypressed(void){ _pas_set_raw(); fd_set _fds; struct timeval _tv={0,0}; FD_ZERO(&_fds); FD_SET(0,&_fds); return select(1,&_fds,0,0,&_tv)>0; }");
+        if (!userProcs.count("clrscr"))
+            emitln("static inline void pas_clrscr(void){ write(1,\"\\033[2J\\033[H\",7); }");
+        if (!userProcs.count("gotoxy"))
+            emitln("static inline void pas_gotoxy(long long x, long long y){ char buf[32]; int n=snprintf(buf,sizeof(buf),\"\\033[%lld;%lldH\",y,x); write(1,buf,n); }");
+        emitln("#include <time.h>");
+        emitln("static inline long long pas_gettickcount(void){ struct timespec _ts; clock_gettime(CLOCK_MONOTONIC,&_ts); return (long long)_ts.tv_sec*1000+_ts.tv_nsec/1000000; }");
+        emitln("static void pas_str(long long n, long long w, char* out) { char tmp[64]; snprintf(tmp,sizeof(tmp),\"%lld\",n); long long len=(long long)strlen(tmp); if(w>len){long long pad=w-len; memmove(tmp+pad,tmp,len+1); for(int i=0;i<pad;i++)tmp[i]=' ';} strncpy(out,tmp,1023); }");
         emitln();
 
         // ── Runtime helpers ───────────────────
         emitln("/* Runtime helpers */");
-        emitln("static void pas_print_ll(long long v)  { printf(\"%lld\", v); }");
-        emitln("static void pas_print_d(double v)      { printf(\"%g\", v); }");
-        emitln("static void pas_print_s(const char* v) { printf(\"%s\", v); }");
-        emitln("static void pas_print_c(char v)        { printf(\"%c\", v); }");
+        emitln("static void pas_print_ll(long long v)  { char b[32]; write(1,b,snprintf(b,sizeof(b),\"%lld\",v)); }");
+        emitln("static void pas_print_d(double v)      { char b[64]; write(1,b,snprintf(b,sizeof(b),\"%g\",v)); }");
+        emitln("static void pas_print_s(const char* v) { if(v)write(1,v,strlen(v)); }");
+        emitln("static void pas_print_c(char v)        { write(1,&v,1); }");
         emitln("static void pas_print_val(double v)    { printf(\"%g\", v); }");
         out << "#define PAS_PRINT(x) pas_print_ll((long long)(x))\n";
         emitln();
@@ -3543,6 +3957,18 @@ emitln("#include <string.h>");
                 genDecl(d, true);
         emitln();
 
+        // Populate allProcs for genCall param type lookup
+        std::function<void(const std::vector<ASTPtr>&)> fillAllProcs =
+            [&](const std::vector<ASTPtr>& decls) {
+                for (auto& d : decls) {
+                    if (auto* p = dynamic_cast<ProcDef*>(d.get())) {
+                        std::string pn = p->name; std::transform(pn.begin(),pn.end(),pn.begin(),::tolower);
+                        allProcs[pn] = p;
+                        fillAllProcs(p->decls);
+                    }
+                }
+            };
+        fillAllProcs(prog->declarations);
         // ── Procedure/function definitions ────
         for (auto& d : prog->declarations)
             if (dynamic_cast<ProcDef*>(d.get()))
@@ -3609,6 +4035,12 @@ emitln("#include <string.h>");
         // ── main ──────────────────────────────
         emitln("int main(void) {");
         indent++;
+        // Disable stdout buffering and enable raw terminal mode immediately
+        emitind("setvbuf(stdout, NULL, _IONBF, 0);");
+        // Enable raw mode at startup so arrow keys work from the first keypress
+        // _pas_set_raw is always defined when readkey/keypressed are used
+        if (!userProcs.count("readkey") || !userProcs.count("keypressed"))
+            emitind("_pas_set_raw();");
         // Initialize __type__ for all global object variables
         for (auto& [varId, typeName] : globalObjVars)
             emitind("strncpy(" + varId + ".__type__, \"" + typeName + "\", 63);");
@@ -3659,8 +4091,13 @@ static bool compilePascal(const std::string& source,
         f << cSource;
     }
 
-    // Find SDL2 flags — try multiple known paths
     std::string sdlFlags;
+    // Only link SDL2 if the program actually uses graphics (initgraph, etc.)
+    bool usesGraphics = (cSource.find("pas_initgraph") != std::string::npos ||
+                         cSource.find("pas_line(") != std::string::npos ||
+                         cSource.find("pas_circle(") != std::string::npos ||
+                         cSource.find("pas_bar(") != std::string::npos);
+    if (usesGraphics)
     {
         std::vector<std::string> candidates = {
             "sdl2-config",

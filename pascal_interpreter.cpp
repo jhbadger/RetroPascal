@@ -1552,9 +1552,43 @@ class Interpreter {
         return (it != obj.fields->end()) ? it->second.sval : "";
     }
 
+    // Create a default-initialized object of the given record/object type
+    Value makeDefaultObject(const std::string& tlo) {
+        Value rec = Value::make_record();
+        (*rec.fields)["__type__"] = Value::from_string(tlo);
+        for (auto& [fn, ft] : getAllFields(tlo)) {
+            std::string flo = fn; std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
+            std::string ftlo = ft; std::transform(ftlo.begin(), ftlo.end(), ftlo.begin(), ::tolower);
+            Value fv;
+            if (ftlo=="integer"||ftlo=="longint"||ftlo=="word"||ftlo=="byte") fv=Value::from_int(0);
+            else if (ftlo=="real"||ftlo=="double"||ftlo=="single") fv=Value::from_real(0.0);
+            else if (ftlo=="boolean") fv=Value::from_bool(false);
+            else if (ftlo=="char")    fv=Value::from_char('\0');
+            else if (ftlo=="string")  fv=Value::from_string("");
+            (*rec.fields)[flo] = fv;
+        }
+        return rec;
+    }
+
     Value evalMethodCall(const MethodCallNode* n, std::shared_ptr<Environment> env) {
-        Value objVal = eval(n->object, env);
-        std::string typeName = getObjTypeName(objVal);
+        // Check for constructor-style call: TypeName.Method(args)
+        // where TypeName is a known object type, not a variable
+        Value objVal;
+        std::string typeName;
+        bool isConstructorCall = false;
+        if (auto* vn = dynamic_cast<VarNode*>(n->object.get())) {
+            std::string lo = vn->name;
+            std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+            if (g_recordTypes.count(lo)) {
+                typeName = lo;
+                objVal = makeDefaultObject(lo);
+                isConstructorCall = true;
+            }
+        }
+        if (typeName.empty()) {
+            objVal = eval(n->object, env);
+            typeName = getObjTypeName(objVal);
+        }
         if (typeName.empty()) throw std::runtime_error("Cannot call method on non-object");
 
         auto pd = findMethod(typeName, n->method);
@@ -1616,6 +1650,15 @@ class Interpreter {
         }
 
         if (pd->is_function) return call_env->get(rname);
+        // Constructor-style call: collect modified fields back into objVal and return it
+        if (isConstructorCall) {
+            for (auto& [fn, fv] : *objVal.fields) {
+                if (fn == "__type__") continue;
+                auto it2 = call_env->vars.find(fn);
+                if (it2 != call_env->vars.end()) fv = it2->second;
+            }
+            return objVal;
+        }
         return Value{};
     }
 
@@ -1694,6 +1737,19 @@ class Interpreter {
                 dest = Value::from_string(s);
             }
             return Value{};
+        }
+        if (name == "booltostr") {
+            bool b = eval(arg_nodes[0], env).as_bool();
+            // BoolToStr(b) or BoolToStr(b, UseBoolStrs) — returns "True"/"False"
+            return Value::from_string(b ? "True" : "False");
+        }
+        if (name == "strtobool" || name == "strtobooldef") {
+            std::string s = eval(arg_nodes[0], env).as_string();
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            bool def = arg_nodes.size() > 1 ? eval(arg_nodes[1], env).as_bool() : false;
+            if (s == "true" || s == "1") return Value::from_bool(true);
+            if (s == "false" || s == "0") return Value::from_bool(false);
+            return Value::from_bool(def);
         }
         if (name == "gettickcount") {
             auto now = std::chrono::steady_clock::now().time_since_epoch();

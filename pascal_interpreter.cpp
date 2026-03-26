@@ -271,7 +271,7 @@ struct IfNode         : ASTNode { ASTPtr cond, then_branch, else_branch; };
 struct WhileNode      : ASTNode { ASTPtr cond, body; };
 struct ForNode        : ASTNode { std::string var; ASTPtr from, to; bool downto; ASTPtr body; };
 struct RepeatNode     : ASTNode { ASTPtr body, cond; };
-struct WriteNode      : ASTNode { std::vector<ASTPtr> args; bool newline; };
+struct WriteNode      : ASTNode { std::vector<ASTPtr> args; std::vector<int> widths; std::vector<int> decimals; bool newline; };
 struct ReadNode       : ASTNode { std::vector<ASTPtr> vars; bool newline; };
 struct CallNode       : ASTNode { std::string name; std::vector<ASTPtr> args; };
 struct IndexNode      : ASTNode { ASTPtr array; ASTPtr index; std::vector<ASTPtr> indices; };
@@ -615,8 +615,10 @@ private:
         expect(TokenType::BEGIN);
         auto node = std::make_shared<CompoundNode>();
         while (!check(TokenType::END) && !check(TokenType::EOF_TOKEN)) {
+            size_t prevPos = pos;
             node->statements.push_back(parseStatement());
             match(TokenType::SEMICOLON);
+            if (pos == prevPos) consume(); // skip unrecognized token
         }
         expect(TokenType::END);
         return node;
@@ -652,6 +654,7 @@ private:
             }
             if (check(TokenType::OTHERWISE)) {
                 consume();
+                match(TokenType::COLON); // optional colon after 'otherwise'
                 node->else_branch = parseStatement();
                 match(TokenType::SEMICOLON);
             }
@@ -667,6 +670,16 @@ private:
             return g;
         }
 
+        // Numeric label definition: 100: stmt
+        if (check(TokenType::INTEGER_LITERAL) && peek(1).type == TokenType::COLON) {
+            auto lbl = std::make_shared<LabelNode>();
+            lbl->label = consume().value;
+            consume(); // ':'
+            if (!check(TokenType::SEMICOLON) && !check(TokenType::END) &&
+                !check(TokenType::UNTIL) && !check(TokenType::EOF_TOKEN))
+                lbl->stmt = parseStatement();
+            return lbl;
+        }
         // IDENTIFIER: (label) or identifier statement
         if (check(TokenType::IDENTIFIER)) {
             // Label definition: name: stmt
@@ -737,8 +750,21 @@ private:
         node->newline = check(TokenType::WRITELN);
         consume();
         if (match(TokenType::LPAREN)) {
-            node->args.push_back(parseExpr());
-            while (match(TokenType::COMMA)) node->args.push_back(parseExpr());
+            auto parseOneArg = [&]() {
+                node->args.push_back(parseExpr());
+                int w = -1, d = -1;
+                if (match(TokenType::COLON)) {
+                    if (check(TokenType::INTEGER_LITERAL)) w = (int)std::stoll(consume().value);
+                    else if (check(TokenType::MINUS)) { consume(); w = 0; } // negative width — ignore
+                    if (match(TokenType::COLON)) {
+                        if (check(TokenType::INTEGER_LITERAL)) d = (int)std::stoll(consume().value);
+                    }
+                }
+                node->widths.push_back(w);
+                node->decimals.push_back(d);
+            };
+            parseOneArg();
+            while (match(TokenType::COMMA)) parseOneArg();
             expect(TokenType::RPAREN);
         }
         return node;
@@ -806,6 +832,15 @@ private:
                 idx->index = idx->indices[0];
                 expect(TokenType::RBRACKET);
                 target = idx;
+                // Handle field access after array index: arr[i].field
+                while (check(TokenType::DOT) && peek(1).type == TokenType::IDENTIFIER) {
+                    consume(); // eat '.'
+                    std::string fieldName = expect(TokenType::IDENTIFIER).value;
+                    auto fa = std::make_shared<FieldAccessNode>();
+                    fa->record = target;
+                    fa->field  = fieldName;
+                    target = fa;
+                }
             }
         }
 
@@ -977,6 +1012,29 @@ private:
                     idx->index = idx->indices[0];
                     expect(TokenType::RBRACKET);
                     result = idx;
+                }
+                // Handle field access after array index: k[i].field or k[i].method(...)
+                while (check(TokenType::DOT) && peek(1).type == TokenType::IDENTIFIER) {
+                    consume(); // eat '.'
+                    std::string fieldName = expect(TokenType::IDENTIFIER).value;
+                    if (check(TokenType::LPAREN)) {
+                        auto mc = std::make_shared<MethodCallNode>();
+                        mc->object = result;
+                        mc->method = fieldName;
+                        std::transform(mc->method.begin(), mc->method.end(), mc->method.begin(), ::tolower);
+                        consume(); // eat '('
+                        if (!check(TokenType::RPAREN)) {
+                            mc->args.push_back(parseExpr());
+                            while (match(TokenType::COMMA)) mc->args.push_back(parseExpr());
+                        }
+                        expect(TokenType::RPAREN);
+                        result = mc;
+                    } else {
+                        auto fa = std::make_shared<FieldAccessNode>();
+                        fa->record = result;
+                        fa->field  = fieldName;
+                        result = fa;
+                    }
                 }
                 return result;
             }
@@ -1956,7 +2014,21 @@ class Interpreter {
             return;
         }
         if (auto* n = dynamic_cast<WriteNode*>(node.get())) {
-            for (auto& a : n->args) std::cout << eval(a, env).to_string();
+            for (size_t ai = 0; ai < n->args.size(); ++ai) {
+                Value v = eval(n->args[ai], env);
+                int w = (ai < n->widths.size()) ? n->widths[ai] : -1;
+                int d = (ai < n->decimals.size()) ? n->decimals[ai] : -1;
+                std::string s;
+                if (d >= 0 && (v.vtype == Value::Type::REAL || v.vtype == Value::Type::INT)) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%.*f", d, v.as_real());
+                    s = buf;
+                } else {
+                    s = v.to_string();
+                }
+                if (w > 0 && (int)s.size() < w) s = std::string(w - s.size(), ' ') + s;
+                std::cout << s;
+            }
             if (n->newline) std::cout << "\n";
             std::cout.flush();
             return;
@@ -2576,6 +2648,14 @@ class Compiler {
                 return base + "[" + row + " - " + base + "_lo]";
             }
             std::string idx  = genExpr(n->index);
+            // For string variables, lower bound is always 1
+            std::string bareIdx = base.substr(4); // strip "pas_"
+            auto vtIt = varTypes.find(bareIdx);
+            std::string vt = (vtIt != varTypes.end()) ? vtIt->second : "";
+            std::transform(vt.begin(), vt.end(), vt.begin(), ::tolower);
+            if (vt == "string" || vt == "char*") {
+                return base + "[" + idx + " - 1]";
+            }
             return base + "[" + idx + " - " + base + "_lo]";
         }
         if (auto* n = dynamic_cast<UnaryOpNode*>(node.get())) {
@@ -3086,17 +3166,33 @@ class Compiler {
             return;
         }
         if (auto* n = dynamic_cast<WriteNode*>(node.get())) {
-            for (auto& arg : n->args) {
+            for (size_t ai = 0; ai < n->args.size(); ++ai) {
+                auto& arg = n->args[ai];
+                int fw = (ai < n->widths.size()) ? n->widths[ai] : -1;
+                int fd = (ai < n->decimals.size()) ? n->decimals[ai] : -1;
                 std::string e = genExpr(arg);
+                // Helper lambdas that emit formatted print calls
+                auto emitFmtD = [&](const std::string& expr) {
+                    if (fd >= 0)
+                        emitind("pas_print_fmt_d((double)(" + expr + ")," + std::to_string(fw < 0 ? 0 : fw) + "," + std::to_string(fd) + ");");
+                    else if (fw > 0)
+                        emitind("{ char _b[64]; int _n=snprintf(_b,sizeof(_b),\"%g\",(double)(" + expr + ")); if(" + std::to_string(fw) + ">_n){char _p[64];snprintf(_p,sizeof(_p),\"%*g\"," + std::to_string(fw) + ",(double)(" + expr + "));write(1,_p,strlen(_p));}else write(1,_b,_n); }");
+                    else
+                        emitind("pas_print_d((double)(" + expr + "));");
+                };
+                auto emitFmtLL = [&](const std::string& expr) {
+                    if (fw > 0)
+                        emitind("pas_print_fmt_ll((long long)(" + expr + ")," + std::to_string(fw) + ");");
+                    else
+                        emitind("pas_print_ll((long long)(" + expr + "));");
+                };
                 if (dynamic_cast<StringNode*>(arg.get()))
                     emitind("pas_print_s(" + e + ");");
                 else if (dynamic_cast<CharNode*>(arg.get()))
                     emitind("pas_print_c(" + e + ");");
                 else if (auto* num = dynamic_cast<NumberNode*>(arg.get())) {
-                    if (num->is_int)
-                        emitind("pas_print_ll((long long)(" + e + "));");
-                    else
-                        emitind("pas_print_d((double)(" + e + "));");
+                    if (num->is_int) emitFmtLL(e);
+                    else emitFmtD(e);
                 } else if (auto* fa = dynamic_cast<FieldAccessNode*>(arg.get())) {
                     // Record field or zero-arg method call
                     std::string ftype = getFieldType(fa);
@@ -3110,27 +3206,19 @@ class Compiler {
                         if (pd2 && pd2->is_function) {
                             std::string rt = pd2->return_type;
                             std::transform(rt.begin(), rt.end(), rt.begin(), ::tolower);
-                            if (rt == "real" || rt == "double" || rt == "single")
-                                emitind("pas_print_d((double)(" + e + "));");
-                            else if (rt == "string")
-                                emitind("pas_print_s(" + e + ");");
-                            else if (rt == "char")
-                                emitind("pas_print_c((char)(" + e + "));");
-                            else
-                                emitind("pas_print_ll((long long)(" + e + "));");
+                            if (rt == "real" || rt == "double" || rt == "single") emitFmtD(e);
+                            else if (rt == "string") emitind("pas_print_s(" + e + ");");
+                            else if (rt == "char") emitind("pas_print_c((char)(" + e + "));");
+                            else emitFmtLL(e);
                         } else {
                             emitind("PAS_PRINT(" + e + ");");
                         }
                     } else {
                         std::transform(ftype.begin(), ftype.end(), ftype.begin(), ::tolower);
-                        if (ftype == "real" || ftype == "double" || ftype == "single")
-                            emitind("pas_print_d((double)(" + e + "));");
-                        else if (ftype == "char")
-                            emitind("pas_print_c((char)(" + e + "));");
-                        else if (ftype == "string")
-                            emitind("pas_print_s(" + e + ");");
-                        else
-                            emitind("pas_print_ll((long long)(" + e + "));");
+                        if (ftype == "real" || ftype == "double" || ftype == "single") emitFmtD(e);
+                        else if (ftype == "char") emitind("pas_print_c((char)(" + e + "));");
+                        else if (ftype == "string") emitind("pas_print_s(" + e + ");");
+                        else emitFmtLL(e);
                     }
                 } else if (auto* vn = dynamic_cast<VarNode*>(arg.get())) {
                     // Variable — look up type (also handle zero-arg self methods)
@@ -3146,14 +3234,10 @@ class Compiler {
                         if (pd3 && pd3->is_function) vtype = pd3->return_type;
                     }
                     std::transform(vtype.begin(), vtype.end(), vtype.begin(), ::tolower);
-                    if (vtype == "real" || vtype == "double" || vtype == "single")
-                        emitind("pas_print_d((double)(" + e + "));");
-                    else if (vtype == "char")
-                        emitind("pas_print_c((char)(" + e + "));");
-                    else if (vtype == "string")
-                        emitind("pas_print_s(" + e + ");");
-                    else
-                        emitind("pas_print_ll((long long)(" + e + "));");
+                    if (vtype == "real" || vtype == "double" || vtype == "single") emitFmtD(e);
+                    else if (vtype == "char") emitind("pas_print_c((char)(" + e + "));");
+                    else if (vtype == "string") emitind("pas_print_s(" + e + ");");
+                    else emitFmtLL(e);
                 } else if (auto* mc = dynamic_cast<MethodCallNode*>(arg.get())) {
                     // Method call — look up return type
                     std::string typeName = getExprTypeName(mc->object);
@@ -3162,14 +3246,10 @@ class Compiler {
                     if (pd2 && pd2->is_function) {
                         std::string rt = pd2->return_type;
                         std::transform(rt.begin(), rt.end(), rt.begin(), ::tolower);
-                        if (rt == "real" || rt == "double" || rt == "single")
-                            emitind("pas_print_d((double)(" + e + "));");
-                        else if (rt == "string")
-                            emitind("pas_print_s(" + e + ");");
-                        else if (rt == "char")
-                            emitind("pas_print_c((char)(" + e + "));");
-                        else
-                            emitind("pas_print_ll((long long)(" + e + "));");
+                        if (rt == "real" || rt == "double" || rt == "single") emitFmtD(e);
+                        else if (rt == "string") emitind("pas_print_s(" + e + ");");
+                        else if (rt == "char") emitind("pas_print_c((char)(" + e + "));");
+                        else emitFmtLL(e);
                     } else {
                         emitind("PAS_PRINT(" + e + ");");
                     }
@@ -3201,7 +3281,7 @@ class Compiler {
                     if (isCharElem)
                         emitind("pas_print_c((char)(" + e + "));");
                     else if (isRealExpr(arg))
-                        emitind("pas_print_d((double)(" + e + "));");
+                        emitFmtD(e);
                     else {
                         // Check if it's a call to a char-returning function
                         bool isCharCall = false;
@@ -3221,7 +3301,7 @@ class Compiler {
                         if (isCharCall)
                             emitind("pas_print_c((char)(" + e + "));");
                         else
-                            emitind("pas_print_ll((long long)(" + e + "));");
+                            emitFmtLL(e);
                     }
                 }
             }
@@ -3236,14 +3316,16 @@ class Compiler {
                     auto it = varTypes.find(lo);
                     std::string vtype = (it != varTypes.end()) ? it->second : "";
                     std::transform(vtype.begin(), vtype.end(), vtype.begin(), ::tolower);
+                    bool isByRef = byRefParams.count(lo) > 0;
+                    std::string addr = isByRef ? safeId(vn->name) : ("&" + safeId(vn->name));
                     if (vtype == "real" || vtype == "double" || vtype == "single")
-                        emitind("scanf(\"%lf\", &" + safeId(vn->name) + ");");
+                        emitind("scanf(\"%lf\", " + addr + ");");
                     else if (vtype == "char")
-                        emitind("scanf(\"%c\", &" + safeId(vn->name) + ");");
+                        emitind("scanf(\" %c\", " + addr + ");");
                     else if (vtype == "string")
                         emitind("scanf(\"%1023s\", " + safeId(vn->name) + ");");
                     else
-                        emitind("scanf(\"%lld\", &" + safeId(vn->name) + ");");
+                        emitind("scanf(\"%lld\", " + addr + ");");
                 }
             }
             if (n->newline) emitind("{ char _nl[256]; fgets(_nl, sizeof(_nl), stdin); }");
@@ -3290,6 +3372,16 @@ class Compiler {
             }
             std::string result = genCall(n->name, n->args, false);
             if (!result.empty()) emitind(result + ";");
+            return;
+        }
+        if (auto* n = dynamic_cast<GotoNode*>(node.get())) {
+            emitind("goto lbl_" + n->label + ";");
+            return;
+        }
+        if (auto* n = dynamic_cast<LabelNode*>(node.get())) {
+            // Emit label at current indent (labels in C can't be at end of block without stmt)
+            out << std::string(indent > 0 ? (indent-1)*4 : 0, ' ') << "lbl_" << n->label << ":;\n";
+            if (n->stmt) genStmt(n->stmt);
             return;
         }
     }
@@ -3920,6 +4012,8 @@ static void _pas_set_raw(void) { if(_pas_raw_mode) return; tcgetattr(0,&_pas_ori
         emitln("static void pas_print_s(const char* v) { if(v)write(1,v,strlen(v)); }");
         emitln("static void pas_print_c(char v)        { write(1,&v,1); }");
         emitln("static void pas_print_val(double v)    { printf(\"%g\", v); }");
+        emitln("static void pas_print_fmt_d(double v,int w,int d) { char b[64]; int n=snprintf(b,sizeof(b),\"%.*f\",d,v); if(w>n){char p[64];snprintf(p,sizeof(p),\"%*.*f\",w,d,v);write(1,p,strlen(p));}else write(1,b,n); }");
+        emitln("static void pas_print_fmt_ll(long long v,int w) { char b[32]; int n=snprintf(b,sizeof(b),\"%lld\",v); if(w>n){char p[32];snprintf(p,sizeof(p),\"%*lld\",w,v);write(1,p,strlen(p));}else write(1,b,n); }");
         out << "#define PAS_PRINT(x) pas_print_ll((long long)(x))\n";
         emitln();
         // String helpers

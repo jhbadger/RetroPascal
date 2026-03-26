@@ -2347,6 +2347,22 @@ class Compiler {
             std::string ft = getFieldType(fa); std::transform(ft.begin(),ft.end(),ft.begin(),::tolower);
             return ft == "string";
         }
+        // Index into an array-of-string yields a string element.
+        // Note: indexing a string variable (string[i]) yields a char, not a string.
+        if (auto* idx = dynamic_cast<IndexNode*>(node.get())) {
+            if (auto* vn = dynamic_cast<VarNode*>(idx->array.get())) {
+                std::string lo = vn->name;
+                std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
+                // Only check arrayElemType (declared arrays), not varTypes
+                // because varTypes["string_var"] == "string" but string[i] is a char
+                auto it = arrayElemType.find(lo);
+                if (it != arrayElemType.end()) {
+                    std::string et = it->second;
+                    std::transform(et.begin(), et.end(), et.begin(), ::tolower);
+                    if (et == "string") return true;
+                }
+            }
+        }
         if (auto* bn = dynamic_cast<BinOpNode*>(node.get())) return bn->op=="+" && (isStrExpr(bn->left)||isStrExpr(bn->right));
         return false;
     }
@@ -2696,8 +2712,16 @@ class Compiler {
             if (n->op == "and") return "(" + l + " && " + r + ")";
             if (n->op == "or")  return "(" + l + " || " + r + ")";
             if (n->op == "xor") return "(" + l + " ^ "  + r + ")";
-            if (n->op == "=")   return "(" + l + " == " + r + ")";
-            if (n->op == "<>")  return "(" + l + " != " + r + ")";
+            if (n->op == "=") {
+                if (isStrExpr(n->left) || isStrExpr(n->right))
+                    return "(strncmp(" + l + ", " + r + ", 1023) == 0)";
+                return "(" + l + " == " + r + ")";
+            }
+            if (n->op == "<>") {
+                if (isStrExpr(n->left) || isStrExpr(n->right))
+                    return "(strncmp(" + l + ", " + r + ", 1023) != 0)";
+                return "(" + l + " != " + r + ")";
+            }
             if (n->op == "<")   return "(" + l + " < "  + r + ")";
             if (n->op == "<=")  return "(" + l + " <= " + r + ")";
             if (n->op == ">")   return "(" + l + " > "  + r + ")";
@@ -2784,12 +2808,17 @@ class Compiler {
                     call += genExpr(args[i]);
                 }
             }
-            // Pass _outer_ret_ to nested procs
+            // Pass _outer_ret_ and captured outer vars to nested procs
             if (isNested) {
                 if (!args.empty()) call += ", ";
-                // Pass current _ret_ pointer if we're in a function, else NULL
                 if (!currentFunc.empty()) call += "&_ret_";
                 else call += "NULL";
+                // Pass outer captured vars
+                auto oIt = nestedOuterVars.find(callName);
+                if (oIt != nestedOuterVars.end()) {
+                    for (auto& [vn, vt] : oIt->second)
+                        call += ", " + vn;
+                }
             }
             return call + ")";
         }
@@ -2944,7 +2973,21 @@ class Compiler {
                 if (aeit != arrayElemType.end()) {
                     std::string et = aeit->second; std::transform(et.begin(),et.end(),et.begin(),::tolower);
                     if (et == "string") {
-                        // strncpy(Name[i-1], rhs, 1023)
+                        // 2D array-of-string: Name[i,j] := str
+                        if (idx->indices.size() > 1) {
+                            auto dit2 = arrayDims.find(vnlo);
+                            if (dit2 != arrayDims.end() && dit2->second.size() >= 2) {
+                                int lo0 = dit2->second[0].lo, lo1 = dit2->second[1].lo;
+                                int cols = dit2->second[1].hi - dit2->second[1].lo + 1;
+                                std::string row = genExpr(idx->indices[0]);
+                                std::string col = genExpr(idx->indices[1]);
+                                std::string flatIdx = "(" + row + " - " + std::to_string(lo0) + ") * " +
+                                                     std::to_string(cols) + " + (" + col + " - " + std::to_string(lo1) + ")";
+                                emitind("strncpy(" + base + "[" + flatIdx + "], " + rhs + ", 1023);");
+                                return;
+                            }
+                        }
+                        // 1D array-of-string: strncpy(Name[i-lo], rhs, 1023)
                         emitind("strncpy(" + base + "[" + genExpr(idx->index) + " - " + base + "_lo], " + rhs + ", 1023);");
                         return;
                     }
@@ -3235,7 +3278,11 @@ class Compiler {
                     }
                     std::transform(vtype.begin(), vtype.end(), vtype.begin(), ::tolower);
                     if (vtype == "real" || vtype == "double" || vtype == "single") emitFmtD(e);
-                    else if (vtype == "char") emitind("pas_print_c((char)(" + e + "));");
+                    else if (vtype == "char") {
+                        // Array of char is a string; scalar char is a single character
+                        if (arrayElemType.count(lo)) emitind("pas_print_s(" + e + ");");
+                        else emitind("pas_print_c((char)(" + e + "));");
+                    }
                     else if (vtype == "string") emitind("pas_print_s(" + e + ");");
                     else emitFmtLL(e);
                 } else if (auto* mc = dynamic_cast<MethodCallNode*>(arg.get())) {
@@ -3255,8 +3302,8 @@ class Compiler {
                     }
                 } else {
                     // BinOp, IndexNode, CallNode, or other expression
-                    // Check if it's a char array element
-                    bool isCharElem = false;
+                    // Check if it's a char/string array element
+                    bool isCharElem = false, isStringElem = false;
                     if (auto* idx = dynamic_cast<IndexNode*>(arg.get())) {
                         if (auto* vn2 = dynamic_cast<VarNode*>(idx->array.get())) {
                             std::string vlo2 = vn2->name;
@@ -3267,18 +3314,23 @@ class Compiler {
                                 std::string et2 = aeit2->second;
                                 std::transform(et2.begin(),et2.end(),et2.begin(),::tolower);
                                 if (et2 == "char") isCharElem = true;
+                                else if (et2 == "string") isStringElem = true;
                             } else {
                                 // Fall back to varTypes
                                 auto vit2 = varTypes.find(vlo2);
                                 if (vit2 != varTypes.end()) {
                                     std::string vt2 = vit2->second;
                                     std::transform(vt2.begin(),vt2.end(),vt2.begin(),::tolower);
+                                    // string[i] yields a char
                                     if (vt2 == "char") isCharElem = true;
+                                    else if (vt2 == "string") isCharElem = true;
                                 }
                             }
                         }
                     }
-                    if (isCharElem)
+                    if (isStringElem)
+                        emitind("pas_print_s(" + e + ");");
+                    else if (isCharElem)
                         emitind("pas_print_c((char)(" + e + "));");
                     else if (isRealExpr(arg))
                         emitFmtD(e);
@@ -3416,6 +3468,8 @@ class Compiler {
     std::string nestedPrefix; // prefix for lifted nested proc names
     std::map<std::string,std::string> nestedCallNames; // short name -> mangled name for current scope
     std::vector<std::string> outerFuncRetNames; // stack of outer function return var names
+    // Maps mangled nested proc name -> list of (C_var_name, C_type) for outer captured vars
+    std::map<std::string, std::vector<std::pair<std::string,std::string>>> nestedOuterVars;
 
     void genDecl(const ASTPtr& node, bool global) {
         if (auto* vd = dynamic_cast<VarDecl*>(node.get())) {
@@ -3442,6 +3496,9 @@ class Compiler {
                     std::transform(etlo.begin(), etlo.end(), etlo.begin(), ::tolower);
                     if (etlo == "string")
                         emitind("char " + id + "[" + std::to_string(sz) + "][1024];");
+                    else if (etlo == "char")
+                        // char arrays are used as strings: allocate as string buffer
+                        emitind("char " + id + "[1024];");
                     else
                         emitind(elemCT + " " + id + "[" + std::to_string(sz) + "];");
                     emitind("const int " + id + "_lo = " + std::to_string(vd->array_lo) + ";");
@@ -3582,9 +3639,16 @@ class Compiler {
             if (pd->params[i].by_ref && ptdef != "string") ct += "*";
             sig += ct + " " + safeId(pd->params[i].name);
         }
-        // If this is a nested proc (has a prefix), add hidden _outer_ret_ param
-        if (!nestedPrefix.empty() && procName.find("__") != std::string::npos)
+        // If this is a nested proc (has a prefix), add hidden _outer_ret_ param + outer captured vars
+        if (!nestedPrefix.empty() && procName.find("__") != std::string::npos) {
             sig += (sig.back() == '(' ? std::string("") : std::string(", ")) + "void* _outer_ret_";
+            std::string fullMangledName = "pas_" + procName;
+            auto oIt = nestedOuterVars.find(fullMangledName);
+            if (oIt != nestedOuterVars.end()) {
+                for (auto& [vn, vt] : oIt->second)
+                    sig += ", " + vt + " " + vn;
+            }
+        }
         sig += ")";
 
         // Emit nested proc/func definitions BEFORE this function (C doesn't allow nesting)
@@ -3610,6 +3674,59 @@ class Compiler {
                 std::string nlo = npd->name;
                 std::transform(nlo.begin(), nlo.end(), nlo.begin(), ::tolower);
                 nestedCallNames[nlo] = "pas_" + nestedPrefix + "__" + nlo;
+            }
+        }
+        // Collect outer vars that nested procs may capture (params + scalar locals)
+        {
+            std::vector<std::pair<std::string,std::string>> outerVars;
+            for (auto& p : pd->params) {
+                std::string plo = p.name;
+                std::transform(plo.begin(), plo.end(), plo.begin(), ::tolower);
+                std::string ct = cType(p.type);
+                std::string ptlo = p.type;
+                std::transform(ptlo.begin(), ptlo.end(), ptlo.begin(), ::tolower);
+                if (p.by_ref && ptlo != "string") ct += "*";
+                outerVars.push_back({safeId(plo), ct});
+            }
+            for (auto& d2 : pd->decls) {
+                if (auto* vd = dynamic_cast<VarDecl*>(d2.get())) {
+                    if (!vd->is_array && !vd->is_record) {
+                        for (auto& nm : vd->names) {
+                            std::string nlo = nm;
+                            std::transform(nlo.begin(), nlo.end(), nlo.begin(), ::tolower);
+                            outerVars.push_back({safeId(nlo), cType(vd->type_name)});
+                        }
+                    }
+                }
+            }
+            for (auto& d2 : pd->decls) {
+                if (auto* npd = dynamic_cast<ProcDef*>(d2.get())) {
+                    std::string nlo = npd->name;
+                    std::transform(nlo.begin(), nlo.end(), nlo.begin(), ::tolower);
+                    std::string mangledName = "pas_" + nestedPrefix + "__" + nlo;
+                    // Build set of names the nested proc defines itself
+                    std::set<std::string> ownNames;
+                    for (auto& p : npd->params) {
+                        std::string plo = p.name;
+                        std::transform(plo.begin(), plo.end(), plo.begin(), ::tolower);
+                        ownNames.insert(plo);
+                    }
+                    for (auto& d3 : npd->decls) {
+                        if (auto* vd2 = dynamic_cast<VarDecl*>(d3.get())) {
+                            for (auto& nm : vd2->names) {
+                                std::string lo2 = nm;
+                                std::transform(lo2.begin(), lo2.end(), lo2.begin(), ::tolower);
+                                ownNames.insert(lo2);
+                            }
+                        }
+                    }
+                    nestedOuterVars[mangledName].clear();
+                    for (auto& [vname, vtype] : outerVars) {
+                        std::string bareId = vname.substr(4); // strip "pas_"
+                        if (!ownNames.count(bareId))
+                            nestedOuterVars[mangledName].push_back({vname, vtype});
+                    }
+                }
             }
         }
         for (auto& d : pd->decls) {

@@ -3606,15 +3606,12 @@ public:
         emitln("#include <stdio.h>");
         emitln("#include <stdlib.h>");
         emitln("#include <string.h>");
-emitln("#include <time.h>");
-emitln("#include <sys/select.h>");
-        emitln("#include <math.h>");
+        emitln("#include <unistd.h>");
         emitln("#include <time.h>");
+        emitln("#include <sys/select.h>");
+        emitln("#include <math.h>");
         emitln("#include <ctype.h>");
         emitln("#include <stdarg.h>");
-emitln("#include <string.h>");
-emitln("#include <time.h>");
-emitln("#include <sys/select.h>");
         emitln();
 
         // Graphics — full SDL2 implementation inline, only when program uses graphics
@@ -3839,8 +3836,9 @@ emitln("#include <sys/select.h>");
         } // end if (usesGraphics)
         emitln();
 
-        // ── Terminal stubs — outside #ifdef so they work with or without SDL2 ──
-        // Raw terminal mode helpers (used by readkey and keypressed)
+        // ── Terminal stubs — only for non-graphics programs ──
+        // Graphics programs use SDL versions defined above in the #ifdef HAVE_SDL2 block
+        if (!usesGraphics) {
         if (!userProcs.count("readkey") || !userProcs.count("keypressed")) {
             emitln(R"(
 #include <termios.h>
@@ -3854,15 +3852,15 @@ static void _pas_set_raw(void) { if(_pas_raw_mode) return; tcgetattr(0,&_pas_ori
 #endif
 )");
         }
-        if (!userProcs.count("readkey")) {
+        if (!userProcs.count("readkey"))
             emitln(R"(static char pas_readkey(void) { _pas_set_raw(); char ch; if(read(0,&ch,1)!=1)return 0; if(ch==27){ struct timeval tv={0,50000}; fd_set f; FD_ZERO(&f); FD_SET(0,&f); char s[2]={0}; if(select(1,&f,0,0,&tv)>0&&read(0,s,1)==1&&s[0]=='['){ if(select(1,&f,0,0,&tv)>0&&read(0,s+1,1)==1){ if(s[1]=='A')return 1; if(s[1]=='B')return 2; if(s[1]=='C')return 4; if(s[1]=='D')return 3; } } return 27; } if(ch==10)ch=13; return ch; })");
-        }
         if (!userProcs.count("keypressed"))
             emitln("static inline int pas_keypressed(void){ _pas_set_raw(); fd_set _fds; struct timeval _tv={0,0}; FD_ZERO(&_fds); FD_SET(0,&_fds); return select(1,&_fds,0,0,&_tv)>0; }");
         if (!userProcs.count("clrscr"))
             emitln("static inline void pas_clrscr(void){ write(1,\"\\033[2J\\033[H\",7); }");
         if (!userProcs.count("gotoxy"))
             emitln("static inline void pas_gotoxy(long long x, long long y){ char buf[32]; int n=snprintf(buf,sizeof(buf),\"\\033[%lld;%lldH\",y,x); write(1,buf,n); }");
+        } // end if (!usesGraphics)
         emitln("#include <time.h>");
         emitln("static inline long long pas_gettickcount(void){ struct timespec _ts; clock_gettime(CLOCK_MONOTONIC,&_ts); return (long long)_ts.tv_sec*1000+_ts.tv_nsec/1000000; }");
         emitln("static void pas_str(long long n, long long w, char* out) { char tmp[64]; snprintf(tmp,sizeof(tmp),\"%lld\",n); long long len=(long long)strlen(tmp); if(w>len){long long pad=w-len; memmove(tmp+pad,tmp,len+1); for(int i=0;i<pad;i++)tmp[i]=' ';} strncpy(out,tmp,1023); }");
@@ -4037,9 +4035,8 @@ static void _pas_set_raw(void) { if(_pas_raw_mode) return; tcgetattr(0,&_pas_ori
         indent++;
         // Disable stdout buffering and enable raw terminal mode immediately
         emitind("setvbuf(stdout, NULL, _IONBF, 0);");
-        // Enable raw mode at startup so arrow keys work from the first keypress
-        // _pas_set_raw is always defined when readkey/keypressed are used
-        if (!userProcs.count("readkey") || !userProcs.count("keypressed"))
+        // Enable raw mode at startup for terminal programs only
+        if (!usesGraphics && (!userProcs.count("readkey") || !userProcs.count("keypressed")))
             emitind("_pas_set_raw();");
         // Initialize __type__ for all global object variables
         for (auto& [varId, typeName] : globalObjVars)
@@ -4092,12 +4089,8 @@ static bool compilePascal(const std::string& source,
     }
 
     std::string sdlFlags;
-    // Only link SDL2 if the program actually uses graphics (initgraph, etc.)
-    bool usesGraphics = (cSource.find("pas_initgraph") != std::string::npos ||
-                         cSource.find("pas_line(") != std::string::npos ||
-                         cSource.find("pas_circle(") != std::string::npos ||
-                         cSource.find("pas_bar(") != std::string::npos);
-    if (usesGraphics)
+    // Use the compiler's own graphics detection
+    if (compiler.usesGraphics)
     {
         std::vector<std::string> candidates = {
             "sdl2-config",

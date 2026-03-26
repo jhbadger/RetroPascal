@@ -2222,6 +2222,7 @@ class Compiler {
     std::string currentMethodType; // type name when inside a method body, else ""
     std::set<std::string> userProcs; // user-defined proc/func names (lower-case)
     std::map<std::string, std::string> varTypes; // varname(lower) -> pascal type
+    std::set<std::string> byRefParams; // param names that are var (pointer) params
 
     // ── Type helpers ──────────────────────────
     std::string cType(const std::string& pas) {
@@ -2530,6 +2531,9 @@ class Compiler {
                 if (pit != allProcs.end() && pit->second->is_function && pit->second->params.empty())
                     return "pas_" + lo + "()";
             }
+            // Dereference by-ref (var) params when reading
+            if (byRefParams.count(lo))
+                return "(*" + safeId(n->name) + ")";
             return safeId(n->name);
         }
         if (auto* n = dynamic_cast<IndexNode*>(node.get())) {
@@ -2686,7 +2690,19 @@ class Compiler {
                         }
                     }
                 }
-                call += genExpr(args[i]);
+                // Pass by-ref params with &
+                bool byRef = pd2 && i < pd2->params.size() && pd2->params[i].by_ref;
+                std::string ptlo2;
+                if (pd2 && i < pd2->params.size()) {
+                    ptlo2 = pd2->params[i].type;
+                    std::transform(ptlo2.begin(),ptlo2.end(),ptlo2.begin(),::tolower);
+                }
+                if (byRef && ptlo2 != "string") {
+                    // var param: pass address, unless it's a string (already char*)
+                    call += "&" + genExpr(args[i]);
+                } else {
+                    call += genExpr(args[i]);
+                }
             }
             // Pass _outer_ret_ to nested procs
             if (isNested) {
@@ -2978,6 +2994,8 @@ class Compiler {
                 }
                 if (lhsIsStr || rhsIsStr)
                     emitind("strncpy(" + lhs + ", " + rhsExpr + ", 1023);");
+                else if (byRefParams.count(vlo))
+                    emitind("*" + lhs + " = " + rhsExpr + ";");
                 else
                     emitind(lhs + " = " + rhsExpr + ";");
                 return;
@@ -3184,8 +3202,27 @@ class Compiler {
                         emitind("pas_print_c((char)(" + e + "));");
                     else if (isRealExpr(arg))
                         emitind("pas_print_d((double)(" + e + "));");
-                    else
-                        emitind("pas_print_ll((long long)(" + e + "));");
+                    else {
+                        // Check if it's a call to a char-returning function
+                        bool isCharCall = false;
+                        if (auto* cn = dynamic_cast<CallNode*>(arg.get())) {
+                            std::string clo = cn->name;
+                            std::transform(clo.begin(),clo.end(),clo.begin(),::tolower);
+                            auto pit = allProcs.find(clo);
+                            if (pit != allProcs.end()) {
+                                std::string rt = pit->second->return_type;
+                                std::transform(rt.begin(),rt.end(),rt.begin(),::tolower);
+                                if (rt == "char") isCharCall = true;
+                            }
+                            // Built-in char functions
+                            if (clo == "chr" || clo == "upcase" || clo == "lowercase")
+                                isCharCall = true;
+                        }
+                        if (isCharCall)
+                            emitind("pas_print_c((char)(" + e + "));");
+                        else
+                            emitind("pas_print_ll((long long)(" + e + "));");
+                    }
                 }
             }
             if (n->newline) emitind("write(1,\"\\n\",1);");
@@ -3329,7 +3366,11 @@ class Compiler {
                 }
             }
         } else if (auto* cd = dynamic_cast<ConstDecl*>(node.get())) {
-            emitind("const long long " + safeId(cd->name) + " = " + genExpr(cd->value) + ";");
+            // Use char type for char constants to avoid comparison warnings
+            if (dynamic_cast<CharNode*>(cd->value.get()))
+                emitind("const char " + safeId(cd->name) + " = " + genExpr(cd->value) + ";");
+            else
+                emitind("const long long " + safeId(cd->name) + " = " + genExpr(cd->value) + ";");
         }
     }
 
@@ -3388,10 +3429,16 @@ class Compiler {
         }
 
         // Record parameter types (may shadow globals — save them)
+        byRefParams.clear();
         for (auto& p : pd->params) {
             std::string lo = p.name; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
             if (globalVarNames.count(lo)) savedGlobals[lo] = varTypes[lo];
             varTypes[lo] = p.type;
+            // Track var (by-ref, non-string) params — they are pointers in C
+            if (p.by_ref) {
+                std::string ptlo = p.type; std::transform(ptlo.begin(),ptlo.end(),ptlo.begin(),::tolower);
+                if (ptlo != "string") byRefParams.insert(lo);
+            }
         }
         if (pd->is_function) {
             std::string lo = pd->name; std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);

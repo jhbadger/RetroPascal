@@ -55,6 +55,7 @@ enum class TokenType {
     PROGRAM, VAR, CONST, BEGIN, END, IF, THEN, ELSE,
     WHILE, DO, FOR, TO, DOWNTO, REPEAT, UNTIL,
     PROCEDURE, FUNCTION, ARRAY, OF, RECORD, TYPE, OBJECT, USES, LABEL, GOTO, CASE, OTHERWISE,
+    WITH,
     DIV, MOD, AND, OR, NOT, XOR,
     TRUE, FALSE,
     INTEGER, REAL, BOOLEAN, STRING, CHAR,
@@ -100,6 +101,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"char",      TokenType::CHAR},
     {"write",     TokenType::WRITE},     {"writeln",   TokenType::WRITELN},
     {"read",      TokenType::READ},      {"readln",    TokenType::READLN},
+    {"with",      TokenType::WITH},
 };
 
 // ─────────────────────────────────────────────
@@ -212,15 +214,44 @@ public:
                 case ';': tokens.push_back({TokenType::SEMICOLON, ";", tok_line}); break;
                 case ',': tokens.push_back({TokenType::COMMA,     ",", tok_line}); break;
                 case '=': tokens.push_back({TokenType::EQ,        "=", tok_line}); break;
-                case '^': tokens.push_back({TokenType::XOR,       "xor", tok_line}); break;
+                case '^':
+                    // Control char literal: ^A=1, ^M=13, ^[=27, etc.
+                    if (pos < src.size() && (std::isalpha(src[pos]) || src[pos] == '[' || src[pos] == ']' || src[pos] == '@' || src[pos] == '\\' || src[pos] == '_')) {
+                        char ctrl = src[pos++];
+                        char ch = (char)(std::toupper((unsigned char)ctrl) - 64);
+                        tokens.push_back({TokenType::CHAR_LITERAL, std::string(1, ch), tok_line});
+                    } else {
+                        tokens.push_back({TokenType::XOR, "xor", tok_line});
+                    }
+                    break;
+                case '$': {
+                    // Hex integer literal: $FF, $1B, etc.
+                    std::string hex;
+                    while (pos < src.size() && std::isxdigit((unsigned char)src[pos]))
+                        hex += src[pos++];
+                    if (hex.empty()) throw std::runtime_error("Expected hex digits after '$'");
+                    long long val = std::stoll(hex, nullptr, 16);
+                    tokens.push_back({TokenType::INTEGER_LITERAL, std::to_string(val), tok_line});
+                    break;
+                }
                 case '#': {
-                    // #N  — Turbo Pascal numeric char literal e.g. #13 #27
-                    std::string num;
-                    while (pos < src.size() && isdigit(src[pos]))
-                        num += src[pos++];
-                    if (num.empty()) throw std::runtime_error("Expected digit after '#'");
-                    char ch = (char)std::stoi(num);
-                    tokens.push_back({TokenType::CHAR_LITERAL, std::string(1, ch), tok_line});
+                    // #N or #$NN  — Turbo Pascal numeric char literal e.g. #13 #27 #$1B
+                    long long chval = 0;
+                    if (pos < src.size() && src[pos] == '$') {
+                        pos++; // skip $
+                        std::string hex;
+                        while (pos < src.size() && std::isxdigit((unsigned char)src[pos]))
+                            hex += src[pos++];
+                        if (hex.empty()) throw std::runtime_error("Expected hex after #$");
+                        chval = std::stoll(hex, nullptr, 16);
+                    } else {
+                        std::string num;
+                        while (pos < src.size() && isdigit(src[pos]))
+                            num += src[pos++];
+                        if (num.empty()) throw std::runtime_error("Expected digit after '#'");
+                        chval = std::stoi(num);
+                    }
+                    tokens.push_back({TokenType::CHAR_LITERAL, std::string(1, (char)chval), tok_line});
                     break;
                 }
                 case ':':
@@ -240,8 +271,12 @@ public:
                     if (peek() == '=') { advance(); tokens.push_back({TokenType::GE, ">=", tok_line}); }
                     else tokens.push_back({TokenType::GT, ">", tok_line});
                     break;
+                case '\x1a': // DOS Ctrl-Z EOF marker — treat as end of file
+                    tokens.push_back({TokenType::EOF_TOKEN, "", tok_line});
+                    return tokens;
                 default:
-                    throw std::runtime_error("Unknown character '" + std::string(1,c) + "' at line " + std::to_string(tok_line));
+                    // Skip unknown characters silently to handle non-standard encodings
+                    break;
             }
         }
         return tokens;
@@ -271,7 +306,10 @@ struct IfNode         : ASTNode { ASTPtr cond, then_branch, else_branch; };
 struct WhileNode      : ASTNode { ASTPtr cond, body; };
 struct ForNode        : ASTNode { std::string var; ASTPtr from, to; bool downto; ASTPtr body; };
 struct RepeatNode     : ASTNode { ASTPtr body, cond; };
-struct WriteNode      : ASTNode { std::vector<ASTPtr> args; std::vector<int> widths; std::vector<int> decimals; bool newline; };
+struct WriteNode      : ASTNode { std::vector<ASTPtr> args; std::vector<int> widths; std::vector<int> decimals; bool newline;
+    std::vector<ASTPtr> widthExprs;   // per-arg dynamic width (or null)
+    std::vector<ASTPtr> decimalExprs; // per-arg dynamic decimal (or null)
+};
 struct ReadNode       : ASTNode { std::vector<ASTPtr> vars; bool newline; };
 struct CallNode       : ASTNode { std::string name; std::vector<ASTPtr> args; };
 struct IndexNode      : ASTNode { ASTPtr array; ASTPtr index; std::vector<ASTPtr> indices; };
@@ -306,7 +344,10 @@ struct ConstDecl : ASTNode { std::string name; ASTPtr value; };
 struct FieldAccessNode : ASTNode { ASTPtr record; std::string field; };
 struct GotoNode        : ASTNode { std::string label; };
 struct LabelNode       : ASTNode { std::string label; ASTPtr stmt; };
-struct SetMemberNode   : ASTNode { ASTPtr expr; std::vector<ASTPtr> elements; };
+struct SetMemberNode   : ASTNode { ASTPtr expr; std::vector<ASTPtr> elements; ASTPtr set_var; };
+struct SetRangeNode    : ASTNode { ASTPtr lo, hi; };
+struct SetLiteralNode  : ASTNode { std::vector<ASTPtr> elements; };
+struct WithNode        : ASTNode { ASTPtr record_expr; ASTPtr body; };
 struct CaseBranch { std::vector<ASTPtr> values; ASTPtr body; };
 struct CaseNode : ASTNode { ASTPtr expr; std::vector<CaseBranch> branches; ASTPtr else_branch; };
 struct MethodCallNode  : ASTNode {
@@ -323,6 +364,21 @@ struct ObjTypeDef {
     std::unordered_map<std::string, std::shared_ptr<struct ProcDef>> methods;
 };
 static std::unordered_map<std::string, ObjTypeDef> g_recordTypes;
+static std::map<std::string, int> g_enumValues;            // enum name (lowercase) -> ordinal
+static std::map<std::string, std::pair<int,int>> g_typeRanges; // type alias -> (lo, hi)
+static std::map<std::string, int> g_constInts;             // parse-time integer constants
+
+struct ArrayTypeAlias {
+    std::vector<std::pair<int,int>> dims; // each dimension's (lo, hi)
+    std::string elemType;
+};
+static std::map<std::string, ArrayTypeAlias> g_arrayTypeAliases;  // type alias for arrays
+static std::set<std::string> g_stringTypeAliases;               // type aliases that are strings
+
+// Text file I/O: Pascal text file variables
+static std::unordered_map<std::string, std::string>    g_file_names;    // varname -> filename
+static std::unordered_map<std::string, std::ifstream*> g_file_handles;  // varname -> open stream
+static std::set<std::string>                           g_file_vars;     // known file variable names
 
 // Helper: get all fields including inherited ones
 static std::vector<std::pair<std::string,std::string>> getAllFields(const std::string& typeName) {
@@ -365,6 +421,13 @@ class Parser {
     size_t pos = 0;
 
     Token& peek(int offset = 0) { return tokens[std::min(pos + offset, tokens.size()-1)]; }
+    // Helper: lowercase value of current token (for case-insensitive identifier checks)
+    std::string peekIdLo() {
+        if (!check(TokenType::IDENTIFIER)) return "";
+        std::string v = peek().value;
+        std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+        return v;
+    }
     Token consume() { return tokens[pos++]; }
     Token expect(TokenType t) {
         if (peek().type != t)
@@ -395,13 +458,38 @@ private:
     std::vector<std::pair<std::string,std::string>> parseRecordFields() {
         std::vector<std::pair<std::string,std::string>> fields;
         while (!check(TokenType::END) && !check(TokenType::EOF_TOKEN)) {
-            if (!check(TokenType::IDENTIFIER)) break;
+            if (!check(TokenType::IDENTIFIER) && !check(TokenType::PROCEDURE) && !check(TokenType::FUNCTION)) break;
+            if (check(TokenType::PROCEDURE) || check(TokenType::FUNCTION)) break; // method decls handled above
             std::vector<std::string> fnames;
             fnames.push_back(consume().value);
             while (match(TokenType::COMMA))
                 fnames.push_back(expect(TokenType::IDENTIFIER).value);
             expect(TokenType::COLON);
-            std::string ftype = consume().value;
+            std::string ftype;
+            // Check for "set of X"
+            if (peekIdLo() == "set") {
+                consume(); // eat 'set'
+                if (match(TokenType::OF)) consume(); // eat element type
+                ftype = "__set__";
+            } else if (check(TokenType::INTEGER_LITERAL) || check(TokenType::CHAR_LITERAL)) {
+                // subrange like 0..20 or 'A'..'Z' — treat as integer/char
+                bool isChar = check(TokenType::CHAR_LITERAL);
+                consume(); // low bound
+                if (match(TokenType::DOTDOT)) consume(); // high bound
+                ftype = isChar ? "char" : "integer";
+            } else {
+                ftype = consume().value;
+                // Handle String[n] or type[n] in field type
+                if (check(TokenType::LBRACKET)) { consume(); consume(); expect(TokenType::RBRACKET); }
+                // Handle 'array[lo..hi] of type' field type
+                if (ftype == "array") {
+                    if (match(TokenType::LBRACKET)) {
+                        while (!check(TokenType::RBRACKET) && !check(TokenType::EOF_TOKEN)) consume();
+                        expect(TokenType::RBRACKET);
+                    }
+                    if (match(TokenType::OF)) ftype = consume().value;
+                }
+            }
             match(TokenType::SEMICOLON);
             for (auto& fn : fnames)
                 fields.push_back({fn, ftype});
@@ -485,9 +573,108 @@ private:
                         match(TokenType::SEMICOLON);
                         g_recordTypes[typeName].fields = fields;
                         g_recordTypes[typeName].parent = parent;
+                    } else if (check(TokenType::LPAREN)) {
+                        // Enum type: Attributes = (Constant, Formula, Txt, ...)
+                        consume(); // eat '('
+                        int ord = 0;
+                        while (!check(TokenType::RPAREN) && !check(TokenType::EOF_TOKEN)) {
+                            if (check(TokenType::IDENTIFIER)) {
+                                std::string ename = consume().value;
+                                std::string enlo = ename;
+                                std::transform(enlo.begin(), enlo.end(), enlo.begin(), ::tolower);
+                                g_enumValues[enlo] = ord++;
+                            }
+                            match(TokenType::COMMA);
+                        }
+                        expect(TokenType::RPAREN);
+                        // Register enum type range so it can be used as array index
+                        g_typeRanges[typeName] = {0, ord - 1};
+                        match(TokenType::SEMICOLON);
+                    } else if (check(TokenType::STRING)) {
+                        // string[n] type alias: Anystring = string[70]
+                        consume(); // eat 'string'
+                        if (match(TokenType::LBRACKET)) { consume(); expect(TokenType::RBRACKET); }
+                        g_stringTypeAliases.insert(typeName); // register for var init
+                        match(TokenType::SEMICOLON);
+                    } else if (check(TokenType::ARRAY)) {
+                        // Array type alias: Cells = array[SheetIndex,1..FYMax] of CellRec
+                        consume(); // eat 'array'
+                        ArrayTypeAlias ta;
+                        expect(TokenType::LBRACKET);
+                        // parse dimensions
+                        auto parseDimBound = [&]() -> int {
+                            if (check(TokenType::INTEGER_LITERAL)) return std::stoi(consume().value);
+                            if (check(TokenType::CHAR_LITERAL))    return (unsigned char)consume().value[0];
+                            if (check(TokenType::IDENTIFIER)) {
+                                std::string nm = consume().value;
+                                std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                                auto it = g_typeRanges.find(nm);
+                                if (it != g_typeRanges.end()) return it->second.first; // lo
+                                auto ci = g_constInts.find(nm);
+                                if (ci != g_constInts.end()) return ci->second;
+                                return 0;
+                            }
+                            return 0;
+                        };
+                        auto parseDim = [&]() -> std::pair<int,int> {
+                            // Could be single type name (SheetIndex/enum) or lo..hi
+                            if (check(TokenType::IDENTIFIER)) {
+                                std::string nm = peek().value;
+                                std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                                auto it = g_typeRanges.find(nm);
+                                if (it != g_typeRanges.end()) { consume(); return it->second; }
+                                // Enum type used as index: find max ordinal
+                                // e.g. StandardFunction = (fabs,fsqrt,...,ffact) -> {0, count-1}
+                                // Scan g_enumValues for any value in this enum type
+                                // We can't easily reconstruct the type bounds here, so
+                                // fall through to parseBound2 which returns 0 for identifiers
+                            }
+                            int lo = parseDimBound();
+                            if (!match(TokenType::DOTDOT)) return {lo, lo};
+                            int hi = parseDimBound();
+                            // hi might be an identifier
+                            if (hi == 0 && check(TokenType::IDENTIFIER)) {
+                                std::string nm = consume().value;
+                                std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                                auto ci = g_constInts.find(nm);
+                                if (ci != g_constInts.end()) hi = ci->second;
+                            }
+                            return {lo, hi};
+                        };
+                        ta.dims.push_back(parseDim());
+                        while (match(TokenType::COMMA)) ta.dims.push_back(parseDim());
+                        expect(TokenType::RBRACKET);
+                        expect(TokenType::OF);
+                        ta.elemType = consume().value;
+                        std::transform(ta.elemType.begin(), ta.elemType.end(), ta.elemType.begin(), ::tolower);
+                        // Skip optional [n] for string[n] element types
+                        if (check(TokenType::LBRACKET)) { consume(); consume(); expect(TokenType::RBRACKET); }
+                        g_arrayTypeAliases[typeName] = ta;
+                        match(TokenType::SEMICOLON);
+                    } else if (check(TokenType::INTEGER_LITERAL) || check(TokenType::CHAR_LITERAL)) {
+                        // Subrange type: SheetIndex = 'A'..'G' or 1..N
+                        bool isChar = check(TokenType::CHAR_LITERAL);
+                        int lo = isChar ? (unsigned char)consume().value[0] : std::stoi(consume().value);
+                        int hi = lo;
+                        if (match(TokenType::DOTDOT)) {
+                            if (check(TokenType::CHAR_LITERAL)) hi = (unsigned char)consume().value[0];
+                            else if (check(TokenType::INTEGER_LITERAL)) hi = std::stoi(consume().value);
+                            else if (check(TokenType::IDENTIFIER)) {
+                                std::string nm = consume().value;
+                                std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                                auto ci = g_constInts.find(nm);
+                                if (ci != g_constInts.end()) hi = ci->second;
+                            }
+                        }
+                        g_typeRanges[typeName] = {lo, hi};
+                        match(TokenType::SEMICOLON);
                     } else {
-                        // type alias — skip for now
-                        consume();
+                        // generic type alias — skip entire expression
+                        while (!check(TokenType::SEMICOLON) && !check(TokenType::EOF_TOKEN)
+                               && !check(TokenType::IDENTIFIER) // stop before next type name
+                               && !check(TokenType::TYPE) && !check(TokenType::VAR) && !check(TokenType::PROCEDURE)
+                               && !check(TokenType::FUNCTION) && !check(TokenType::BEGIN))
+                            consume();
                         match(TokenType::SEMICOLON);
                     }
                 }
@@ -518,26 +705,70 @@ private:
                 g_recordTypes[anonName].fields = vd->record_fields;
                 vd->type_name = anonName;
                 match(TokenType::SEMICOLON);
+            } else if (peekIdLo() == "set") {
+                // set of X
+                consume(); // 'set'
+                match(TokenType::OF); // 'of'
+                // consume element type (identifier or keyword like Char, Integer, Byte...)
+                if (check(TokenType::IDENTIFIER) || check(TokenType::CHAR) ||
+                    check(TokenType::INTEGER) || check(TokenType::BOOLEAN))
+                    consume();
+                vd->type_name = "__set__";
+                match(TokenType::SEMICOLON);
+            } else if (peekIdLo() == "file") {
+                // file of X — stub: skip
+                consume(); // 'file'
+                match(TokenType::OF);
+                if (check(TokenType::IDENTIFIER)) consume(); // element type
+                vd->type_name = "__file__";
+                match(TokenType::SEMICOLON);
+            } else if (peekIdLo() == "text") {
+                // text file
+                consume(); // 'text'
+                vd->type_name = "__file__";
+                match(TokenType::SEMICOLON);
             } else if (match(TokenType::ARRAY)) {
-                // Array type — may be multi-dimensional: array[1..16, 1..61]
+                // Array type — may be multi-dimensional: array[1..16, 1..61] or array[SheetIndex]
                 vd->is_array = true;
                 expect(TokenType::LBRACKET);
-                // First dimension
-                vd->array_lo = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
-                expect(TokenType::DOTDOT);
-                vd->array_hi = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
-                vd->array_dims.push_back({vd->array_lo, vd->array_hi});
-                // Additional dimensions: , lo..hi
+                // Helper lambda to parse a single array dim bound (int, char, or identifier/const)
+                auto parseBound = [&]() -> int {
+                    if (check(TokenType::INTEGER_LITERAL)) return std::stoi(consume().value);
+                    if (check(TokenType::CHAR_LITERAL))    return (unsigned char)consume().value[0];
+                    if (check(TokenType::IDENTIFIER)) {
+                        std::string nm = consume().value;
+                        std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                        auto ci = g_constInts.find(nm);
+                        if (ci != g_constInts.end()) return ci->second;
+                        return 0;
+                    }
+                    return 0;
+                };
+                // Parse first dimension: could be "SheetIndex" or "lo..hi"
+                auto parseDim = [&]() -> std::pair<int,int> {
+                    if (check(TokenType::IDENTIFIER)) {
+                        std::string nm = peek().value;
+                        std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                        auto it = g_typeRanges.find(nm);
+                        if (it != g_typeRanges.end()) { consume(); return it->second; }
+                    }
+                    int lo2 = parseBound();
+                    if (!match(TokenType::DOTDOT)) return {lo2, lo2};
+                    int hi2 = parseBound();
+                    return {lo2, hi2};
+                };
+                auto dim0 = parseDim();
+                vd->array_lo = dim0.first;
+                vd->array_hi = dim0.second;
+                vd->array_dims.push_back({dim0.first, dim0.second});
                 while (match(TokenType::COMMA)) {
-                    ArrayDim d;
-                    d.lo = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
-                    expect(TokenType::DOTDOT);
-                    d.hi = std::stoi(expect(TokenType::INTEGER_LITERAL).value);
-                    vd->array_dims.push_back(d);
-                    // Extend the flat size: total = product of all dimensions
-                    vd->array_hi = vd->array_lo + 
-                        (vd->array_dims[0].hi - vd->array_dims[0].lo + 1) *
-                        (d.hi - d.lo + 1) - 1;
+                    auto dn = parseDim();
+                    vd->array_dims.push_back({dn.first, dn.second});
+                    // Flat size = product of all dimensions from dim0
+                    int total = 1;
+                    for (auto& ad : vd->array_dims)
+                        total *= (ad.hi - ad.lo + 1);
+                    vd->array_hi = vd->array_lo + total - 1;
                 }
                 expect(TokenType::RBRACKET);
                 expect(TokenType::OF);
@@ -545,14 +776,40 @@ private:
                 match(TokenType::SEMICOLON);
             } else {
                 vd->type_name = consume().value;
-                // Check if this is a known record type name
+                // Check if it's a type alias (string[n], etc.)
+                if (check(TokenType::LBRACKET)) {
+                    consume(); consume(); expect(TokenType::RBRACKET); // string[n]
+                }
+                // Normalize type name
                 std::string lo = vd->type_name;
                 std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);
-                if (g_recordTypes.count(lo)) {
+                // Check if it's a known array type alias (e.g. Cells)
+                auto at = g_arrayTypeAliases.find(lo);
+                if (at != g_arrayTypeAliases.end()) {
+                    vd->is_array = true;
+                    auto& ta = at->second;
+                    vd->type_name = ta.elemType;
+                    vd->array_dims = {};
+                    for (auto& d : ta.dims)
+                        vd->array_dims.push_back({d.first, d.second});
+                    if (!vd->array_dims.empty()) {
+                        vd->array_lo = vd->array_dims[0].lo;
+                        int total = 1;
+                        for (auto& d2 : vd->array_dims) total *= (d2.hi - d2.lo + 1);
+                        vd->array_hi = vd->array_lo + total - 1;
+                    }
+                    // Check if element type is a record
+                    if (g_recordTypes.count(ta.elemType)) {
+                        vd->is_record = false; // is_array takes precedence
+                        vd->record_fields = getAllFields(ta.elemType);
+                    }
+                } else if (g_recordTypes.count(lo)) {
                     vd->is_record = true;
                     vd->record_fields = getAllFields(lo);
                 }
-                expect(TokenType::SEMICOLON);
+                // Check if it's a subrange type alias (treated as char or int)
+                // nothing special needed — just use the type name
+                match(TokenType::SEMICOLON);
             }
             decls.push_back(vd);
         }
@@ -562,8 +819,134 @@ private:
         while (check(TokenType::IDENTIFIER)) {
             auto cd = std::make_shared<ConstDecl>();
             cd->name = consume().value;
+            // Typed const: name: type = value (Turbo Pascal extension)
+            if (check(TokenType::COLON)) {
+                consume(); // ':'
+                // Parse type annotation: array[X] of Y or simple type
+                bool isTypedArray = false;
+                std::vector<std::pair<int,int>> taDims;
+                std::string taElemType;
+                if (match(TokenType::ARRAY)) {
+                    isTypedArray = true;
+                    expect(TokenType::LBRACKET);
+                    // Parse dimensions (same logic as in parseVarSection)
+                    auto parseBound2 = [&]() -> int {
+                        if (check(TokenType::INTEGER_LITERAL)) return std::stoi(consume().value);
+                        if (check(TokenType::CHAR_LITERAL))    return (unsigned char)consume().value[0];
+                        if (check(TokenType::IDENTIFIER)) {
+                            std::string nm = consume().value;
+                            std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                            auto it = g_typeRanges.find(nm);
+                            if (it != g_typeRanges.end()) return it->second.first; // lo only
+                            auto ci = g_constInts.find(nm);
+                            if (ci != g_constInts.end()) return ci->second;
+                            return 0;
+                        }
+                        return 0;
+                    };
+                    auto parseDim2 = [&]() -> std::pair<int,int> {
+                        if (check(TokenType::IDENTIFIER)) {
+                            std::string nm = peek().value;
+                            std::transform(nm.begin(), nm.end(), nm.begin(), ::tolower);
+                            auto it = g_typeRanges.find(nm);
+                            if (it != g_typeRanges.end()) { consume(); return it->second; }
+                        }
+                        int lo2 = parseBound2();
+                        if (!match(TokenType::DOTDOT)) return {lo2, lo2};
+                        int hi2 = parseBound2();
+                        return {lo2, hi2};
+                    };
+                    taDims.push_back(parseDim2());
+                    while (match(TokenType::COMMA)) taDims.push_back(parseDim2());
+                    expect(TokenType::RBRACKET);
+                    expect(TokenType::OF);
+                    taElemType = consume().value;
+                    std::transform(taElemType.begin(), taElemType.end(), taElemType.begin(), ::tolower);
+                } else {
+                    // Simple typed const: name: char = 'G', name: set of Char = [...] etc.
+                    // Or typed const using array type alias: name: MyArrayType = (...)
+                    std::string typeTok = peek().value;
+                    std::transform(typeTok.begin(), typeTok.end(), typeTok.begin(), ::tolower);
+                    consume(); // skip the type name
+                    if (typeTok == "set") {
+                        // set of <elemtype>
+                        if (match(TokenType::OF)) consume(); // eat element type
+                    } else if (check(TokenType::LBRACKET)) {
+                        // e.g. string[n]
+                        consume(); consume(); expect(TokenType::RBRACKET);
+                    } else {
+                        // Check if it's an array type alias
+                        auto ait = g_arrayTypeAliases.find(typeTok);
+                        if (ait != g_arrayTypeAliases.end()) {
+                            isTypedArray = true;
+                            for (auto& d : ait->second.dims)
+                                taDims.push_back(d);
+                            taElemType = ait->second.elemType;
+                        }
+                    }
+                }
+                expect(TokenType::EQ);
+                if (isTypedArray) {
+                    // Parse initializer list: (val1, val2, ...)
+                    expect(TokenType::LPAREN);
+                    auto vd2 = std::make_shared<VarDecl>();
+                    vd2->names = {cd->name};
+                    vd2->is_array = true;
+                    vd2->type_name = taElemType;
+                    vd2->array_dims = {};
+                    for (auto& d : taDims)
+                        vd2->array_dims.push_back({d.first, d.second});
+                    if (!vd2->array_dims.empty()) {
+                        vd2->array_lo = vd2->array_dims[0].lo;
+                        int total = 1;
+                        for (auto& d2 : vd2->array_dims) total *= (d2.hi - d2.lo + 1);
+                        vd2->array_hi = vd2->array_lo + total - 1;
+                    }
+                    // Store initializer values in cd->value as a special list
+                    // We'll handle this in processDeclarations
+                    // For now store as a CallNode with name "__array_init__"
+                    auto initCall = std::make_shared<CallNode>();
+                    initCall->name = "__array_init__";
+                    while (!check(TokenType::RPAREN) && !check(TokenType::EOF_TOKEN)) {
+                        initCall->args.push_back(parseExpr());
+                        match(TokenType::COMMA);
+                    }
+                    expect(TokenType::RPAREN);
+                    cd->value = initCall;
+                    // Store VarDecl info in cd somehow — we'll overload name
+                    // Instead, let's push the VarDecl and a special const
+                    decls.push_back(vd2);
+                    // Keep cd as the initializer node
+                    cd->name = "__init_" + cd->name;
+                    // We'll handle __init_ in processDeclarations
+                    decls.push_back(cd);
+                    match(TokenType::SEMICOLON);
+                    continue;
+                } else {
+                    cd->value = parseExpr();
+                    // Record as a parse-time constant if it's a simple integer
+                    if (auto* nn = dynamic_cast<NumberNode*>(cd->value.get())) {
+                        if (nn->is_int) {
+                            std::string nlo = cd->name;
+                            std::transform(nlo.begin(), nlo.end(), nlo.begin(), ::tolower);
+                            g_constInts[nlo] = (int)nn->value;
+                        }
+                    }
+                    expect(TokenType::SEMICOLON);
+                    decls.push_back(cd);
+                    continue;
+                }
+            }
             expect(TokenType::EQ);
             cd->value = parseExpr();
+            // Record as parse-time integer constant for array bounds
+            if (auto* nn = dynamic_cast<NumberNode*>(cd->value.get())) {
+                if (nn->is_int) {
+                    std::string nlo = cd->name;
+                    std::transform(nlo.begin(), nlo.end(), nlo.begin(), ::tolower);
+                    g_constInts[nlo] = (int)nn->value;
+                }
+            }
             expect(TokenType::SEMICOLON);
             decls.push_back(cd);
         }
@@ -624,6 +1007,24 @@ private:
         return node;
     }
 
+    ASTPtr parseWith() {
+        consume(); // eat 'with'
+        auto n = std::make_shared<WithNode>();
+        // Parse the record expression (may include array indexing and field access)
+        n->record_expr = parsePrimary();
+        while (check(TokenType::DOT) && peek(1).type == TokenType::IDENTIFIER) {
+            consume(); // eat '.'
+            std::string field = expect(TokenType::IDENTIFIER).value;
+            auto fa = std::make_shared<FieldAccessNode>();
+            fa->record = n->record_expr;
+            fa->field = field;
+            n->record_expr = fa;
+        }
+        expect(TokenType::DO);
+        n->body = parseStatement();
+        return n;
+    }
+
     ASTPtr parseStatement() {
         if (check(TokenType::BEGIN))     return parseCompound();
         if (check(TokenType::IF))        return parseIf();
@@ -632,6 +1033,7 @@ private:
         if (check(TokenType::REPEAT))    return parseRepeat();
         if (check(TokenType::WRITE) || check(TokenType::WRITELN)) return parseWrite();
         if (check(TokenType::READ) || check(TokenType::READLN))   return parseRead();
+        if (check(TokenType::WITH))      return parseWith();
 
         // CASE statement
         if (check(TokenType::CASE)) {
@@ -640,9 +1042,10 @@ private:
             node->expr = parseExpr();
             expect(TokenType::OF);
             while (!check(TokenType::END) && !check(TokenType::OTHERWISE) &&
-                   !check(TokenType::EOF_TOKEN)) {
+                   !check(TokenType::ELSE) && !check(TokenType::EOF_TOKEN)) {
                 if (check(TokenType::SEMICOLON)) { consume(); continue; }
-                if (check(TokenType::END) || check(TokenType::OTHERWISE)) break;
+                if (check(TokenType::END) || check(TokenType::OTHERWISE) ||
+                    check(TokenType::ELSE)) break;
                 CaseBranch branch;
                 branch.values.push_back(parseExpr());
                 while (match(TokenType::COMMA))
@@ -652,9 +1055,9 @@ private:
                 match(TokenType::SEMICOLON);
                 node->branches.push_back(std::move(branch));
             }
-            if (check(TokenType::OTHERWISE)) {
+            if (check(TokenType::OTHERWISE) || check(TokenType::ELSE)) {
                 consume();
-                match(TokenType::COLON); // optional colon after 'otherwise'
+                match(TokenType::COLON); // optional colon after 'otherwise'/'else'
                 node->else_branch = parseStatement();
                 match(TokenType::SEMICOLON);
             }
@@ -753,15 +1156,21 @@ private:
             auto parseOneArg = [&]() {
                 node->args.push_back(parseExpr());
                 int w = -1, d = -1;
+                ASTPtr wExpr, dExpr;
                 if (match(TokenType::COLON)) {
+                    // Width specifier: integer literal or expression
                     if (check(TokenType::INTEGER_LITERAL)) w = (int)std::stoll(consume().value);
-                    else if (check(TokenType::MINUS)) { consume(); w = 0; } // negative width — ignore
+                    else if (check(TokenType::MINUS)) { consume(); w = 0; }
+                    else wExpr = parseExpr();
                     if (match(TokenType::COLON)) {
                         if (check(TokenType::INTEGER_LITERAL)) d = (int)std::stoll(consume().value);
+                        else dExpr = parseExpr();
                     }
                 }
                 node->widths.push_back(w);
                 node->decimals.push_back(d);
+                node->widthExprs.push_back(wExpr);
+                node->decimalExprs.push_back(dExpr);
             };
             parseOneArg();
             while (match(TokenType::COMMA)) parseOneArg();
@@ -791,9 +1200,12 @@ private:
         if (nameLo == "str" && check(TokenType::LPAREN)) {
             consume(); // '('
             auto valExpr = parseExpr();
-            ASTPtr widthExpr;
-            if (match(TokenType::COLON))
+            ASTPtr widthExpr, decExpr;
+            if (match(TokenType::COLON)) {
                 widthExpr = parseExpr();
+                if (match(TokenType::COLON))
+                    decExpr = parseExpr();
+            }
             expect(TokenType::COMMA);
             auto destExpr = parseExpr(); // should be VarNode
             expect(TokenType::RPAREN);
@@ -801,6 +1213,8 @@ private:
             call->name = "str";
             call->args.push_back(valExpr);
             if (widthExpr) call->args.push_back(widthExpr);
+            else call->args.push_back(std::make_shared<NumberNode>()); // placeholder 0
+            if (decExpr) call->args.push_back(decExpr);
             else call->args.push_back(std::make_shared<NumberNode>()); // placeholder 0
             call->args.push_back(destExpr);
             return call;
@@ -915,18 +1329,34 @@ private:
     }
     ASTPtr parseComparison() {
         auto left = parseAddSub();
-        // Check for 'in [...]' set membership: expr in [a, b, c]
+        // Check for 'in ...' set membership: expr in [a, b, c] or expr in setVar
         if (peek().type == TokenType::IDENTIFIER && peek().value == "in") {
             consume(); // eat 'in'
-            expect(TokenType::LBRACKET);
             auto set = std::make_shared<SetMemberNode>();
             set->expr = left;
-            if (!check(TokenType::RBRACKET)) {
-                set->elements.push_back(parseExpr());
-                while (match(TokenType::COMMA))
-                    set->elements.push_back(parseExpr());
+            if (check(TokenType::LBRACKET)) {
+                consume(); // eat '['
+                if (!check(TokenType::RBRACKET)) {
+                    // Parse elements, handling ranges (a..b)
+                    auto parseSetElem = [&]() -> ASTPtr {
+                        auto lo_e = parseExpr();
+                        if (check(TokenType::DOTDOT)) {
+                            consume();
+                            auto hi_e = parseExpr();
+                            auto rng = std::make_shared<SetRangeNode>();
+                            rng->lo = lo_e; rng->hi = hi_e;
+                            return rng;
+                        }
+                        return lo_e;
+                    };
+                    set->elements.push_back(parseSetElem());
+                    while (match(TokenType::COMMA)) set->elements.push_back(parseSetElem());
+                }
+                expect(TokenType::RBRACKET);
+            } else {
+                // in setVar — variable containing a set
+                set->set_var = parseExpr();
             }
-            expect(TokenType::RBRACKET);
             return set;
         }
         while (check(TokenType::EQ) || check(TokenType::NEQ) ||
@@ -971,6 +1401,28 @@ private:
         return parsePrimary();
     }
     ASTPtr parsePrimary() {
+        // Set literal: [a, b, c] or [a..b, c]
+        if (check(TokenType::LBRACKET)) {
+            consume(); // eat '['
+            auto sl = std::make_shared<SetLiteralNode>();
+            if (!check(TokenType::RBRACKET)) {
+                auto parseSetElem2 = [&]() -> ASTPtr {
+                    auto lo_e = parseExpr();
+                    if (check(TokenType::DOTDOT)) {
+                        consume();
+                        auto hi_e = parseExpr();
+                        auto rng = std::make_shared<SetRangeNode>();
+                        rng->lo = lo_e; rng->hi = hi_e;
+                        return rng;
+                    }
+                    return lo_e;
+                };
+                sl->elements.push_back(parseSetElem2());
+                while (match(TokenType::COMMA)) sl->elements.push_back(parseSetElem2());
+            }
+            expect(TokenType::RBRACKET);
+            return sl;
+        }
         if (check(TokenType::INTEGER_LITERAL)) {
             auto n = std::make_shared<NumberNode>();
             n->value = std::stod(consume().value); n->is_int = true;
@@ -1126,6 +1578,10 @@ static void _pas_clrscr() {
 }
 
 static bool _pas_keypressed() {
+    // Non-interactive (piped) input: never pretend a second byte is waiting.
+    // The IBM-PC double-read pattern (null + extended code) doesn't apply here;
+    // we handle arrow keys as ESC sequences inside _pas_readkey instead.
+    if (!isatty(STDIN_FILENO)) return false;
     _enable_raw_mode();
     struct timeval tv = {0, 0};
     fd_set fds;
@@ -1182,7 +1638,7 @@ static char _pas_readkey() {
 //  Runtime Value
 // ─────────────────────────────────────────────
 struct Value {
-    enum class Type { NIL, INT, REAL, BOOL, STRING, CHAR, ARRAY, RECORD } vtype = Type::NIL;
+    enum class Type { NIL, INT, REAL, BOOL, STRING, CHAR, ARRAY, RECORD, SET } vtype = Type::NIL;
     long long   ival = 0;
     double      rval = 0;
     bool        bval = false;
@@ -1197,6 +1653,19 @@ struct Value {
     static Value from_bool(bool v)        { Value x; x.vtype=Type::BOOL;   x.bval=v; return x; }
     static Value from_string(const std::string& v) { Value x; x.vtype=Type::STRING; x.sval=v; return x; }
     static Value from_char(char v)        { Value x; x.vtype=Type::CHAR;   x.cval=v; return x; }
+    // SET: uses ival for bits 0-63, ival2 for bits 64-127
+    long long ival2 = 0;
+    static Value from_set(long long mask) { Value x; x.vtype=Type::SET; x.ival=mask; x.ival2=0; return x; }
+    static Value from_set2(long long lo, long long hi) { Value x; x.vtype=Type::SET; x.ival=lo; x.ival2=hi; return x; }
+    bool set_test(int bit) const {
+        if (bit < 0 || bit > 127) return false;
+        if (bit < 64) return (ival & (1LL << bit)) != 0;
+        return (ival2 & (1LL << (bit - 64))) != 0;
+    }
+    static Value set_or (const Value& a, const Value& b) { return from_set2(a.ival | b.ival, a.ival2 | b.ival2); }
+    static Value set_and(const Value& a, const Value& b) { return from_set2(a.ival & b.ival, a.ival2 & b.ival2); }
+    static Value set_sub(const Value& a, const Value& b) { return from_set2(a.ival & ~b.ival, a.ival2 & ~b.ival2); }
+    bool set_eq (const Value& b) const { return ival == b.ival && ival2 == b.ival2; }
     static Value make_array(int lo, int hi, std::vector<ArrayDim> dims = {}) {
         Value x; x.vtype=Type::ARRAY;
         x.arr.resize(hi - lo + 1);
@@ -1213,10 +1682,14 @@ struct Value {
     long long as_int() const {
         if (vtype == Type::INT)  return ival;
         if (vtype == Type::REAL) return (long long)rval;
+        if (vtype == Type::CHAR) return (unsigned char)cval;
+        if (vtype == Type::BOOL) return bval ? 1 : 0;
+        if (vtype == Type::SET)  return ival;
         throw std::runtime_error("Not an integer");
     }
     bool as_bool() const {
         if (vtype == Type::BOOL) return bval;
+        if (vtype == Type::INT)  return ival != 0;
         throw std::runtime_error("Not a boolean");
     }
     std::string as_string() const {
@@ -1305,28 +1778,26 @@ class Interpreter {
 
         if (auto* n = dynamic_cast<SetMemberNode*>(node.get())) {
             Value v = eval(n->expr, env);
-            for (auto& elem : n->elements) {
-                Value e = eval(elem, env);
-                if (v.vtype == Value::Type::CHAR && e.vtype == Value::Type::CHAR)
-                    { if (v.cval == e.cval) return Value::from_bool(true); }
-                else if (v.vtype == Value::Type::STRING && e.vtype == Value::Type::CHAR)
-                    { if (!v.sval.empty() && v.sval[0] == e.cval) return Value::from_bool(true); }
-                else if (v.as_int() == e.as_int()) return Value::from_bool(true);
+            long long vv = v.as_int();
+            // Check against a set variable (128-bit bitmask)
+            if (n->set_var) {
+                Value sv = eval(n->set_var, env);
+                return Value::from_bool(sv.set_test((int)vv));
             }
-            return Value::from_bool(false);
-        }
-        if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
-            return evalMethodCall(n, env);
-        }
-        if (auto* n = dynamic_cast<SetMemberNode*>(node.get())) {
-            Value v = eval(n->expr, env);
+            // Check against literal set elements
             for (auto& elem : n->elements) {
-                Value e = eval(elem, env);
-                if (v.vtype == Value::Type::CHAR && e.vtype == Value::Type::CHAR)
-                    { if (v.cval == e.cval) return Value::from_bool(true); }
-                else if (v.vtype == Value::Type::STRING && e.vtype == Value::Type::CHAR)
-                    { if (!v.sval.empty() && v.sval[0] == e.cval) return Value::from_bool(true); }
-                else if (v.as_int() == e.as_int()) return Value::from_bool(true);
+                if (auto* rng = dynamic_cast<SetRangeNode*>(elem.get())) {
+                    long long lo_v = eval(rng->lo, env).as_int();
+                    long long hi_v = eval(rng->hi, env).as_int();
+                    if (vv >= lo_v && vv <= hi_v) return Value::from_bool(true);
+                } else {
+                    Value e = eval(elem, env);
+                    if (v.vtype == Value::Type::CHAR && e.vtype == Value::Type::CHAR)
+                        { if (v.cval == e.cval) return Value::from_bool(true); }
+                    else if (v.vtype == Value::Type::STRING && e.vtype == Value::Type::CHAR)
+                        { if (!v.sval.empty() && v.sval[0] == e.cval) return Value::from_bool(true); }
+                    else if (vv == e.as_int()) return Value::from_bool(true);
+                }
             }
             return Value::from_bool(false);
         }
@@ -1342,11 +1813,17 @@ class Interpreter {
                     std::string flo = n->field;
                     std::transform(flo.begin(), flo.end(), flo.begin(), ::tolower);
                     try {
-                        // Evaluate index first
-                        int rawIdx = (int)eval(idx->index, env).as_int();
                         Value& arr = env->get_ref(alo);
                         if (arr.vtype == Value::Type::ARRAY) {
-                            int flat = rawIdx - (int)arr.ival;
+                            int flat = 0;
+                            if (idx->indices.size() > 1 && !arr.arr_dims.empty()) {
+                                int i0 = (int)eval(idx->indices[0], env).as_int() - arr.arr_dims[0].lo;
+                                int i1 = (int)eval(idx->indices[1], env).as_int() - arr.arr_dims[1].lo;
+                                int cols = arr.arr_dims[1].hi - arr.arr_dims[1].lo + 1;
+                                flat = i0 * cols + i1;
+                            } else {
+                                flat = (int)eval(idx->index, env).as_int() - (int)arr.ival;
+                            }
                             if (flat >= 0 && flat < (int)arr.arr.size()) {
                                 Value& elem = arr.arr[flat];
                                 if (elem.fields) {
@@ -1385,7 +1862,8 @@ class Interpreter {
             }
             // Terminal/timer zero-arg functions
             static const std::set<std::string> zeroArgBuiltins = {
-                "keypressed","gettickcount","readkey","clrscr","donewincrt","halt","exit"
+                "keypressed","gettickcount","readkey","clrscr","donewincrt","halt","exit",
+                "highvideo","lowvideo","normvideo","clreol","ioresult"
             };
             if (zeroArgBuiltins.count(lo))
                 return evalCall(lo, {}, env);
@@ -1413,7 +1891,11 @@ class Interpreter {
                 if (pd && pd->is_function) return evalCall(lo, {}, env);
             } else {
             }
-            return env->get(lo);
+            // Try env lookup, then check enum constants
+            try { return env->get(lo); } catch (...) {}
+            auto eit = g_enumValues.find(lo);
+            if (eit != g_enumValues.end()) return Value::from_int(eit->second);
+            throw std::runtime_error("Undefined variable: " + lo);
         }
 
         if (auto* n = dynamic_cast<IndexNode*>(node.get())) {
@@ -1425,8 +1907,13 @@ class Interpreter {
                     return Value::from_char(arr.sval[idx]);
                 return Value::from_char('\0');
             }
-            if (arr.vtype != Value::Type::ARRAY)
-                throw std::runtime_error("Indexing non-array");
+            if (arr.vtype != Value::Type::ARRAY) {
+                // Gather debug info about what's being indexed
+                std::string varName = "?";
+                if (auto* vn = dynamic_cast<VarNode*>(n->array.get())) varName = vn->name;
+                throw std::runtime_error("Indexing non-array: var='" + varName +
+                    "' type=" + std::to_string((int)arr.vtype));
+            }
             int flat = 0;
             if (n->indices.size() > 1 && !arr.arr_dims.empty()) {
                 int idx0 = (int)eval(n->indices[0], env).as_int() - arr.arr_dims[0].lo;
@@ -1436,8 +1923,12 @@ class Interpreter {
             } else {
                 flat = (int)eval(n->index, env).as_int() - (int)arr.ival;
             }
-            if (flat < 0 || flat >= (int)arr.arr.size())
-                throw std::runtime_error("Array index out of bounds");
+            if (flat < 0 || flat >= (int)arr.arr.size()) {
+                std::string varName2 = "?";
+                if (auto* vn = dynamic_cast<VarNode*>(n->array.get())) varName2 = vn->name;
+                throw std::runtime_error("Array index out of bounds (read): var='" + varName2 +
+                    "' flat=" + std::to_string(flat) + " size=" + std::to_string(arr.arr.size()));
+            }
             return arr.arr[flat];
         }
 
@@ -1459,6 +1950,26 @@ class Interpreter {
             return evalCall(n->name, n->args, env);
         }
 
+        if (auto* n = dynamic_cast<SetLiteralNode*>(node.get())) {
+            // Build bitmask from enum ordinals or char ordinals
+            long long lo_bits = 0, hi_bits = 0;
+            auto set_bit = [&](long long b) {
+                if (b < 0 || b > 127) return;
+                if (b < 64) lo_bits |= (1LL << b);
+                else        hi_bits |= (1LL << (b - 64));
+            };
+            for (auto& elem : n->elements) {
+                if (auto* rng = dynamic_cast<SetRangeNode*>(elem.get())) {
+                    long long lo_v = eval(rng->lo, env).as_int();
+                    long long hi_v = eval(rng->hi, env).as_int();
+                    for (long long i = lo_v; i <= hi_v; i++) set_bit(i);
+                } else {
+                    set_bit(eval(elem, env).as_int());
+                }
+            }
+            return Value::from_set2(lo_bits, hi_bits);
+        }
+
         throw std::runtime_error("Cannot evaluate node");
     }
 
@@ -1478,6 +1989,15 @@ class Interpreter {
 
         Value l = eval(lhs, env);
         Value r = eval(rhs, env);
+
+        // Set operations (128-bit: ival=bits 0-63, ival2=bits 64-127)
+        if (l.vtype == Value::Type::SET || r.vtype == Value::Type::SET) {
+            if (op == "+")  return Value::set_or(l, r);
+            if (op == "-")  return Value::set_sub(l, r);
+            if (op == "*")  return Value::set_and(l, r);
+            if (op == "=")  return Value::from_bool(l.set_eq(r));
+            if (op == "<>") return Value::from_bool(!l.set_eq(r));
+        }
 
         // String concatenation
         if (op == "+" && (l.vtype == Value::Type::STRING || l.vtype == Value::Type::CHAR)) {
@@ -1676,8 +2196,8 @@ class Interpreter {
         if (name == "round"){ return Value::from_int((long long)std::round(eval(arg_nodes[0],env).as_real())); }
         if (name == "ord")  { auto v=eval(arg_nodes[0],env); return v.vtype==Value::Type::CHAR ? Value::from_int(v.cval) : Value::from_int(v.as_int()); }
         if (name == "chr")  { return Value::from_char((char)eval(arg_nodes[0],env).as_int()); }
-        if (name == "succ") { return Value::from_int(eval(arg_nodes[0],env).as_int()+1); }
-        if (name == "pred") { return Value::from_int(eval(arg_nodes[0],env).as_int()-1); }
+        if (name == "succ") { auto v=eval(arg_nodes[0],env); return v.vtype==Value::Type::CHAR ? Value::from_char((char)(v.cval+1)) : Value::from_int(v.as_int()+1); }
+        if (name == "pred") { auto v=eval(arg_nodes[0],env); return v.vtype==Value::Type::CHAR ? Value::from_char((char)(v.cval-1)) : Value::from_int(v.as_int()-1); }
         if (name == "length") { return Value::from_int(eval(arg_nodes[0],env).as_string().size()); }
         if (name == "upcase") {
             auto v = eval(arg_nodes[0],env);
@@ -1765,6 +2285,98 @@ class Interpreter {
         }
         if (name == "keypressed") { return Value::from_bool(_pas_keypressed()); }
         if (name == "readkey")    { return Value::from_char(_pas_readkey()); }
+        // CRT video/screen functions
+        if (name == "highvideo")  { printf("\033[1m"); fflush(stdout); return Value{}; }
+        if (name == "lowvideo")   { printf("\033[0m"); fflush(stdout); return Value{}; }
+        if (name == "normvideo")  { printf("\033[0m"); fflush(stdout); return Value{}; }
+        if (name == "clreol")     { printf("\033[K");  fflush(stdout); return Value{}; }
+        if (name == "delay") {
+            if (!arg_nodes.empty()) {
+                long long ms = eval(arg_nodes[0], env).as_int();
+                struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (ms%1000)*1000000;
+                nanosleep(&ts, nullptr);
+            }
+            return Value{};
+        }
+        if (name == "ioresult")   { return Value::from_int(0); } // stub: no error
+        if (name == "exist") {
+            // Exist(filename) - check if file exists
+            if (!arg_nodes.empty()) {
+                std::string fname = eval(arg_nodes[0], env).as_string();
+                std::ifstream f(fname);
+                return Value::from_bool(f.good());
+            }
+            return Value::from_bool(false);
+        }
+        if (name == "assign") {
+            // Assign(filevar, filename)
+            if (arg_nodes.size() >= 2) {
+                if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[0].get())) {
+                    std::string vlo = vn->name;
+                    std::transform(vlo.begin(), vlo.end(), vlo.begin(), ::tolower);
+                    std::string fname = eval(arg_nodes[1], env).as_string();
+                    g_file_names[vlo] = fname;
+                    g_file_vars.insert(vlo);
+                }
+            }
+            return Value{};
+        }
+        if (name == "reset") {
+            // Reset(filevar) - open for reading
+            if (!arg_nodes.empty()) {
+                if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[0].get())) {
+                    std::string vlo = vn->name;
+                    std::transform(vlo.begin(), vlo.end(), vlo.begin(), ::tolower);
+                    auto it = g_file_names.find(vlo);
+                    if (it != g_file_names.end()) {
+                        // Close existing handle if open
+                        auto hit = g_file_handles.find(vlo);
+                        if (hit != g_file_handles.end()) { delete hit->second; g_file_handles.erase(hit); }
+                        auto* fs = new std::ifstream(it->second);
+                        g_file_handles[vlo] = fs;
+                    }
+                }
+            }
+            return Value{};
+        }
+        if (name == "rewrite") { return Value{}; } // stub
+        if (name == "close") {
+            if (!arg_nodes.empty()) {
+                if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[0].get())) {
+                    std::string vlo = vn->name;
+                    std::transform(vlo.begin(), vlo.end(), vlo.begin(), ::tolower);
+                    auto hit = g_file_handles.find(vlo);
+                    if (hit != g_file_handles.end()) { delete hit->second; g_file_handles.erase(hit); }
+                }
+            }
+            return Value{};
+        }
+        if (name == "eof") {
+            // Eof(filevar) or Eof - check end of file
+            if (!arg_nodes.empty()) {
+                if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[0].get())) {
+                    std::string vlo = vn->name;
+                    std::transform(vlo.begin(), vlo.end(), vlo.begin(), ::tolower);
+                    auto hit = g_file_handles.find(vlo);
+                    if (hit != g_file_handles.end()) return Value::from_bool(!hit->second->good() || hit->second->peek() == EOF);
+                }
+            }
+            return Value::from_bool(std::cin.eof());
+        }
+        if (name == "succ") {
+            if (!arg_nodes.empty()) {
+                Value v = eval(arg_nodes[0], env);
+                if (v.vtype == Value::Type::CHAR) return Value::from_char((char)(v.cval + 1));
+                return Value::from_int(v.as_int() + 1);
+            }
+        }
+        if (name == "pred") {
+            if (!arg_nodes.empty()) {
+                Value v = eval(arg_nodes[0], env);
+                if (v.vtype == Value::Type::CHAR) return Value::from_char((char)(v.cval - 1));
+                return Value::from_int(v.as_int() - 1);
+            }
+        }
         if (name == "random") {
             if (arg_nodes.empty()) return Value::from_real((double)rand() / RAND_MAX);
             long long n = eval(arg_nodes[0], env).as_int();
@@ -1786,20 +2398,31 @@ class Interpreter {
         if (name == "max")  { auto a=eval(arg_nodes[0],env), b=eval(arg_nodes[1],env); return a.as_real()>=b.as_real()?a:b; }
         if (name == "min")  { auto a=eval(arg_nodes[0],env), b=eval(arg_nodes[1],env); return a.as_real()<=b.as_real()?a:b; }
         if (name == "str") {
-            // str(value [,width], var_dest) — Turbo Pascal format
-            // Parser emits: [value, width, var] when width given, [value, var] without
+            // str(value [,width [,decimals]], var_dest) — Turbo Pascal format
+            // Parser emits: [value, width, decimals, var] (always 4 args from parser)
+            // or [value, var] without specifiers
             Value v = eval(arg_nodes[0], env);
             ASTPtr varArg;
-            long long width = 0;
-            if (arg_nodes.size() == 3) {
-                width = eval(arg_nodes[1], env).as_int();
+            long long width = 0, decimals = -1;
+            if (arg_nodes.size() == 4) {
+                width    = eval(arg_nodes[1], env).as_int();
+                decimals = eval(arg_nodes[2], env).as_int();
+                varArg   = arg_nodes[3];
+            } else if (arg_nodes.size() == 3) {
+                width  = eval(arg_nodes[1], env).as_int();
                 varArg = arg_nodes[2];
             } else if (arg_nodes.size() == 2) {
                 varArg = arg_nodes[1];
             }
-            std::string s = (v.vtype == Value::Type::REAL)
-                ? [&]{ std::ostringstream o; o << v.rval; return o.str(); }()
-                : std::to_string(v.as_int());
+            std::string s;
+            if (v.vtype == Value::Type::REAL) {
+                std::ostringstream o;
+                if (decimals >= 0) o << std::fixed << std::setprecision((int)decimals) << v.rval;
+                else o << v.rval;
+                s = o.str();
+            } else {
+                s = std::to_string(v.as_int());
+            }
             if (width > 0)
                 while ((long long)s.size() < width) s = " " + s;
             if (varArg) {
@@ -1813,10 +2436,22 @@ class Interpreter {
         }
         if (name == "val") {
             std::string s = eval(arg_nodes[0],env).as_string();
-            if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[1].get())) {
-                std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
-                try { env->set(lo, Value::from_int(std::stoll(s))); }
-                catch (...) { env->set(lo, Value::from_real(std::stod(s))); }
+            int errCode = 0;
+            if (arg_nodes.size() >= 2) {
+                if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[1].get())) {
+                    std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+                    try { env->set(lo, Value::from_int(std::stoll(s))); errCode = 0; }
+                    catch (...) {
+                        try { env->set(lo, Value::from_real(std::stod(s))); errCode = 0; }
+                        catch (...) { errCode = 1; }
+                    }
+                }
+            }
+            if (arg_nodes.size() >= 3) {
+                if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[2].get())) {
+                    std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+                    try { env->set(lo, Value::from_int(errCode)); } catch (...) {}
+                }
             }
             return Value{};
         }
@@ -2050,30 +2685,43 @@ class Interpreter {
         }
         if (auto* n = dynamic_cast<ForNode*>(node.get())) {
             std::string lo = n->var; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
-            long long from_v = eval(n->from, env).as_int();
-            long long to_v   = eval(n->to,   env).as_int();
+            Value from_val = eval(n->from, env);
+            Value to_val   = eval(n->to,   env);
+            bool charLoop = (from_val.vtype == Value::Type::CHAR || to_val.vtype == Value::Type::CHAR);
+            long long from_v = from_val.as_int();
+            long long to_v   = to_val.as_int();
             if (!n->downto) {
                 for (long long i = from_v; i <= to_v; i++) {
-                    env->set(lo, Value::from_int(i));
+                    env->set(lo, charLoop ? Value::from_char((char)i) : Value::from_int(i));
                     exec(n->body, env);
                 }
             } else {
                 for (long long i = from_v; i >= to_v; i--) {
-                    env->set(lo, Value::from_int(i));
+                    env->set(lo, charLoop ? Value::from_char((char)i) : Value::from_int(i));
                     exec(n->body, env);
                 }
             }
             return;
         }
         if (auto* n = dynamic_cast<RepeatNode*>(node.get())) {
-            do { exec(n->body, env); } while (!eval(n->cond, env).as_bool());
+            int _iter = 0;
+            do {
+                exec(n->body, env);
+                _iter++;
+                if (_iter > 200) throw std::runtime_error("Repeat loop exceeded 200 iterations");
+            } while (!eval(n->cond, env).as_bool());
             return;
         }
         if (auto* n = dynamic_cast<WriteNode*>(node.get())) {
             for (size_t ai = 0; ai < n->args.size(); ++ai) {
                 Value v = eval(n->args[ai], env);
+                // Resolve width: dynamic expr takes priority over static int
                 int w = (ai < n->widths.size()) ? n->widths[ai] : -1;
+                if (ai < n->widthExprs.size() && n->widthExprs[ai])
+                    w = (int)eval(n->widthExprs[ai], env).as_int();
                 int d = (ai < n->decimals.size()) ? n->decimals[ai] : -1;
+                if (ai < n->decimalExprs.size() && n->decimalExprs[ai])
+                    d = (int)eval(n->decimalExprs[ai], env).as_int();
                 std::string s;
                 if (d >= 0 && (v.vtype == Value::Type::REAL || v.vtype == Value::Type::INT)) {
                     char buf[64];
@@ -2090,26 +2738,85 @@ class Interpreter {
             return;
         }
         if (auto* n = dynamic_cast<ReadNode*>(node.get())) {
-            for (auto& var : n->vars) {
-                if (auto* vn = dynamic_cast<VarNode*>(var.get())) {
-                    std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
-                    Value& target = env->get_ref(lo);
-                    if (target.vtype == Value::Type::INT) {
-                        long long v; std::cin >> v; target = Value::from_int(v);
-                    } else if (target.vtype == Value::Type::REAL) {
-                        double v; std::cin >> v; target = Value::from_real(v);
-                    } else if (target.vtype == Value::Type::STRING) {
-                        std::string v; std::cin >> v; target = Value::from_string(v);
-                    } else if (target.vtype == Value::Type::CHAR) {
-                        char v; std::cin >> v; target = Value::from_char(v);
-                    } else {
-                        std::string v; std::cin >> v;
-                        try { target = Value::from_int(std::stoll(v)); }
-                        catch (...) { target = Value::from_string(v); }
+            // Check for Read(Kbd, ...) or Read(FileVar, ...) — file/keyboard source
+            size_t startIdx = 0;
+            std::ifstream* fileStream = nullptr;
+            if (!n->vars.empty()) {
+                if (auto* vn0 = dynamic_cast<VarNode*>(n->vars[0].get())) {
+                    std::string n0 = vn0->name;
+                    std::transform(n0.begin(), n0.end(), n0.begin(), ::tolower);
+                    if (n0 == "kbd") { startIdx = 1; } // skip 'Kbd' pseudo-var
+                    else {
+                        auto hit = g_file_handles.find(n0);
+                        if (hit != g_file_handles.end()) {
+                            fileStream = hit->second;
+                            startIdx = 1;
+                        } else if (g_file_vars.count(n0)) {
+                            startIdx = 1; // file var but not open — skip
+                        }
                     }
                 }
             }
-            if (n->newline) {
+            bool useKeyboard = (startIdx == 1 && !fileStream);
+            if (fileStream) {
+                // Read from file
+                for (size_t vi = startIdx; vi < n->vars.size(); vi++) {
+                    auto& var = n->vars[vi];
+                    if (auto* vn = dynamic_cast<VarNode*>(var.get())) {
+                        std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+                        try {
+                            Value& tgt = env->get_ref(lo);
+                            if (tgt.vtype == Value::Type::STRING || tgt.vtype == Value::Type::NIL) {
+                                std::string line;
+                                if (n->newline) std::getline(*fileStream, line);
+                                else { char c; fileStream->get(c); line = std::string(1, c); }
+                                tgt = Value::from_string(line);
+                            } else if (tgt.vtype == Value::Type::INT) {
+                                long long v; *fileStream >> v; tgt = Value::from_int(v);
+                            } else if (tgt.vtype == Value::Type::REAL) {
+                                double v; *fileStream >> v; tgt = Value::from_real(v);
+                            } else if (tgt.vtype == Value::Type::CHAR) {
+                                char c; fileStream->get(c); tgt = Value::from_char(c);
+                            } else {
+                                std::string line; std::getline(*fileStream, line);
+                                tgt = Value::from_string(line);
+                            }
+                        } catch (...) {}
+                    }
+                }
+                return;
+            }
+            for (size_t vi = startIdx; vi < n->vars.size(); vi++) {
+                auto& var = n->vars[vi];
+                // Handle FieldAccess or simple VarNode targets
+                auto getTarget = [&](const ASTPtr& v_expr) -> Value* {
+                    if (auto* vn = dynamic_cast<VarNode*>(v_expr.get())) {
+                        std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+                        try { return &env->get_ref(lo); } catch (...) { return nullptr; }
+                    }
+                    return nullptr;
+                };
+                Value* target = getTarget(var);
+                if (!target) continue;
+                if (useKeyboard) {
+                    // Read a raw keystroke
+                    char ch = _pas_readkey();
+                    *target = Value::from_char(ch);
+                } else if (target->vtype == Value::Type::INT) {
+                    long long v; std::cin >> v; *target = Value::from_int(v);
+                } else if (target->vtype == Value::Type::REAL) {
+                    double v; std::cin >> v; *target = Value::from_real(v);
+                } else if (target->vtype == Value::Type::STRING) {
+                    std::string v; std::cin >> v; *target = Value::from_string(v);
+                } else if (target->vtype == Value::Type::CHAR) {
+                    char v; std::cin >> v; *target = Value::from_char(v);
+                } else {
+                    std::string v; std::cin >> v;
+                    try { *target = Value::from_int(std::stoll(v)); }
+                    catch (...) { *target = Value::from_string(v); }
+                }
+            }
+            if (!useKeyboard && n->newline) {
                 std::string dummy; std::getline(std::cin, dummy);
             }
             return;
@@ -2152,6 +2859,63 @@ class Interpreter {
             if (n->stmt) exec(n->stmt, env);
             return;
         }
+        if (auto* n = dynamic_cast<WithNode*>(node.get())) {
+            // Get a reference to the record in place (don't copy)
+            Value* rec_ptr = nullptr;
+            // Resolve to a pointer into the actual storage
+            auto resolveRef = [&](const ASTPtr& expr) -> Value* {
+                if (auto* vn2 = dynamic_cast<VarNode*>(expr.get())) {
+                    std::string vnlo = vn2->name;
+                    std::transform(vnlo.begin(), vnlo.end(), vnlo.begin(), ::tolower);
+                    try { return &env->get_ref(vnlo); } catch (...) { return nullptr; }
+                }
+                if (auto* idx2 = dynamic_cast<IndexNode*>(expr.get())) {
+                    if (auto* vn2 = dynamic_cast<VarNode*>(idx2->array.get())) {
+                        std::string alo = vn2->name;
+                        std::transform(alo.begin(), alo.end(), alo.begin(), ::tolower);
+                        try {
+                            Value& arrRef = env->get_ref(alo);
+                            if (arrRef.vtype != Value::Type::ARRAY) return nullptr;
+                            int flat2 = 0;
+                            if (idx2->indices.size() > 1 && !arrRef.arr_dims.empty()) {
+                                int i0 = (int)eval(idx2->indices[0], env).as_int() - arrRef.arr_dims[0].lo;
+                                int i1 = (int)eval(idx2->indices[1], env).as_int() - arrRef.arr_dims[1].lo;
+                                flat2 = i0 * (arrRef.arr_dims[1].hi - arrRef.arr_dims[1].lo + 1) + i1;
+                            } else {
+                                flat2 = (int)eval(idx2->index, env).as_int() - (int)arrRef.ival;
+                            }
+                            if (flat2 < 0 || flat2 >= (int)arrRef.arr.size()) return nullptr;
+                            return &arrRef.arr[flat2];
+                        } catch (...) { return nullptr; }
+                    }
+                }
+                return nullptr;
+            };
+            rec_ptr = resolveRef(n->record_expr);
+            if (!rec_ptr) {
+                // Fallback: evaluate and copy (no write-back)
+                Value rec_val = eval(n->record_expr, env);
+                if (rec_val.vtype != Value::Type::RECORD || !rec_val.fields) return;
+                auto with_env = std::make_shared<Environment>(env);
+                for (auto& [fn, fv] : *rec_val.fields)
+                    if (fn != "__type__") with_env->set_local(fn, fv);
+                exec(n->body, with_env);
+                return;
+            }
+            if (rec_ptr->vtype != Value::Type::RECORD || !rec_ptr->fields) return;
+            // Copy fields into a child env
+            auto with_env = std::make_shared<Environment>(env);
+            for (auto& [fn, fv] : *rec_ptr->fields)
+                if (fn != "__type__") with_env->set_local(fn, fv);
+            exec(n->body, with_env);
+            // Write back modified fields to the original record
+            for (auto& [fn, fv] : *rec_ptr->fields) {
+                if (fn == "__type__") continue;
+                auto it = with_env->vars.find(fn);
+                if (it != with_env->vars.end()) fv = it->second;
+            }
+            return;
+        }
         if (auto* n = dynamic_cast<MethodCallNode*>(node.get())) {
             evalMethodCall(n, env);
             return;
@@ -2180,11 +2944,12 @@ class Interpreter {
                             std::string ftlo = ft;
                             std::transform(ftlo.begin(), ftlo.end(), ftlo.begin(), ::tolower);
                             Value fv;
-                            if (ftlo=="integer"||ftlo=="longint"||ftlo=="word"||ftlo=="byte") fv=Value::from_int(0);
+                            if (ftlo=="integer"||ftlo=="longint"||ftlo=="shortint"||ftlo=="word"||ftlo=="byte") fv=Value::from_int(0);
                             else if (ftlo=="real"||ftlo=="double"||ftlo=="single") fv=Value::from_real(0.0);
                             else if (ftlo=="boolean") fv=Value::from_bool(false);
                             else if (ftlo=="char")    fv=Value::from_char('\0');
-                            else if (ftlo=="string")  fv=Value::from_string("");
+                            else if (ftlo=="string"||g_stringTypeAliases.count(ftlo))  fv=Value::from_string("");
+                            else if (ftlo=="__set__") fv=Value::from_set(0);
                             (*rec.fields)[flo] = fv;
                         }
                         env->set_local(lo, rec);
@@ -2193,41 +2958,74 @@ class Interpreter {
                         // If element type is a record, initialize each element
                         std::string elo = vd->type_name;
                         std::transform(elo.begin(), elo.end(), elo.begin(), ::tolower);
-                        if (g_recordTypes.count(elo)) {
-                            for (auto& elem : arrVal.arr) {
-                                elem = Value::make_record();
-                                (*elem.fields)["__type__"] = Value::from_string(elo);
-                                for (auto& [fn, ft] : getAllFields(elo)) {
-                                    std::string flo2 = fn;
-                                    std::transform(flo2.begin(), flo2.end(), flo2.begin(), ::tolower);
-                                    std::string ftlo = ft;
-                                    std::transform(ftlo.begin(), ftlo.end(), ftlo.begin(), ::tolower);
-                                    Value fv;
-                                    if (ftlo=="integer"||ftlo=="longint"||ftlo=="shortint"||ftlo=="word"||ftlo=="byte") fv=Value::from_int(0);
-                                    else if (ftlo=="real"||ftlo=="double"||ftlo=="single") fv=Value::from_real(0.0);
-                                    else if (ftlo=="boolean") fv=Value::from_bool(false);
-                                    else if (ftlo=="char")    fv=Value::from_char('\0');
-                                    else if (ftlo=="string")  fv=Value::from_string("");
-                                    (*elem.fields)[flo2] = fv;
-                                }
+                        auto initRecElem = [&](Value& elem) {
+                            elem = Value::make_record();
+                            (*elem.fields)["__type__"] = Value::from_string(elo);
+                            for (auto& [fn, ft] : getAllFields(elo)) {
+                                std::string flo2 = fn;
+                                std::transform(flo2.begin(), flo2.end(), flo2.begin(), ::tolower);
+                                std::string ftlo = ft;
+                                std::transform(ftlo.begin(), ftlo.end(), ftlo.begin(), ::tolower);
+                                Value fv;
+                                if (ftlo=="integer"||ftlo=="longint"||ftlo=="shortint"||ftlo=="word"||ftlo=="byte") fv=Value::from_int(0);
+                                else if (ftlo=="real"||ftlo=="double"||ftlo=="single") fv=Value::from_real(0.0);
+                                else if (ftlo=="boolean") fv=Value::from_bool(false);
+                                else if (ftlo=="char")    fv=Value::from_char('\0');
+                                else if (ftlo=="string"||g_stringTypeAliases.count(ftlo))  fv=Value::from_string("");
+                                else if (ftlo=="__set__") fv=Value::from_set(0);
+                                (*elem.fields)[flo2] = fv;
                             }
+                        };
+                        if (g_recordTypes.count(elo)) {
+                            for (auto& elem : arrVal.arr) initRecElem(elem);
                         }
                         env->set_local(lo, arrVal);
                     } else {
                         std::string type = vd->type_name;
                         std::transform(type.begin(),type.end(),type.begin(),::tolower);
                         Value v;
-                        if (type=="integer") v = Value::from_int(0);
-                        else if (type=="real") v = Value::from_real(0.0);
+                        if (type=="integer"||type=="longint"||type=="shortint"||type=="word"||type=="byte") v = Value::from_int(0);
+                        else if (type=="real"||type=="double"||type=="single") v = Value::from_real(0.0);
                         else if (type=="boolean") v = Value::from_bool(false);
                         else if (type=="string") v = Value::from_string("");
                         else if (type=="char") v = Value::from_char('\0');
+                        else if (type=="__set__") v = Value::from_set(0);
+                        else if (type=="__file__") { v = Value::from_int(0); g_file_vars.insert(lo); } // file var
+                        // Check string alias (e.g. AnyString = string[70])
+                        else if (g_stringTypeAliases.count(type)) {
+                            v = Value::from_string("");
+                        }
+                        // Check subrange alias → char or int
+                        else {
+                            auto tr = g_typeRanges.find(type);
+                            if (tr != g_typeRanges.end()) {
+                                // subrange: use char if range is in char ASCII range
+                                bool likelyChar = (tr->second.first >= 32 && tr->second.first <= 127);
+                                v = likelyChar ? Value::from_char((char)tr->second.first) : Value::from_int(tr->second.first);
+                            }
+                        }
                         env->set_local(lo, v);
                     }
                 }
             } else if (auto* cd = dynamic_cast<ConstDecl*>(d.get())) {
                 std::string lo = cd->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
-                env->set_local(lo, eval(cd->value, env));
+                // Handle typed const array initializer
+                if (lo.substr(0, 7) == "__init_") {
+                    std::string arrName = lo.substr(7);
+                    // cd->value is a CallNode with name "__array_init__" and args being the init values
+                    if (auto* initCall = dynamic_cast<CallNode*>(cd->value.get())) {
+                        if (initCall->name == "__array_init__") {
+                            try {
+                                Value& arr = env->get_ref(arrName);
+                                for (size_t k = 0; k < initCall->args.size() && k < arr.arr.size(); k++) {
+                                    arr.arr[k] = eval(initCall->args[k], env);
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                } else {
+                    env->set_local(lo, eval(cd->value, env));
+                }
             } else if (auto* pd = dynamic_cast<ProcDef*>(d.get())) {
                 std::string lo = pd->name;
                 std::transform(lo.begin(), lo.end(), lo.begin(), ::tolower);

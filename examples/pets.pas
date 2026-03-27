@@ -3,7 +3,8 @@ program Pets;
 type
 Pet = object
   name : string;
-  speak: procedure;
+  procedure speak;
+  procedure init(name: string);
 end;
 
 Cat = object(Pet)

@@ -4,25 +4,38 @@ type
 Pet = object
   name : string;
   procedure speak;
-  procedure init(name: string);
+  procedure init(n: string);
 end;
 
 Cat = object(Pet)
+  procedure speak;  // Forward declaration
   procedure factorial(n: integer);
 end;
 
-Dog = object(Pet)
+Bird = object(Pet)
+   procedure speak;  // Forward declaration
 end;
 
-function factorial(n: integer) : integer;
+
+Dog = object(Pet)
+  procedure speak;
+end;
+
+
+function fac(n: integer) : integer;
 begin
-  if (n < 2) then factorial := 1
-  else factorial := n*factorial(n-1);
+  if (n < 2) then fac := 1
+  else fac := n*fac(n-1);
 end;
 
 procedure Pet.init(n:string);
 begin
   name := n;
+end;
+
+procedure Pet.speak;
+begin
+   writeln(name, ': [generic pet noises]');
 end;
 
 procedure Cat.speak;
@@ -33,8 +46,13 @@ end;
 procedure Cat.factorial(n : integer);
 var f: integer;
 begin
-  f := factorial(n);
+  f := fac(n);
   writeln(name, ': The factorial of ', n, ' is ', f, '.');
+end;
+
+procedure Bird.speak;
+begin
+  writeln(name, ': chirp chirp!');
 end;
 
 procedure Dog.speak;
@@ -45,11 +63,17 @@ end;
 var 
 pico: Cat;
 snuggles: Dog;
+tweety: Bird;
+pety: Pet;
 
 begin
   pico.init('Pico');
   snuggles.init('Snuggles');
+  tweety.init('Tweety');
+  pety.init('Pety');
   pico.speak;
   pico.factorial(6);
   snuggles.speak;
+  tweety.speak;
+  pety.speak;
 end.

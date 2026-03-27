@@ -1577,10 +1577,15 @@ static void _pas_clrscr() {
     fflush(stdout);
 }
 
+// Buffer for IBM-PC extended key second byte (arrow keys etc.)
+// When an arrow key is detected, _pas_readkey returns \x00 and stores
+// the IBM code here; the next call returns (and clears) this byte.
+static char _ibm_pending = 0;
+
 static bool _pas_keypressed() {
-    // Non-interactive (piped) input: never pretend a second byte is waiting.
-    // The IBM-PC double-read pattern (null + extended code) doesn't apply here;
-    // we handle arrow keys as ESC sequences inside _pas_readkey instead.
+    // If an IBM extended-key second byte is buffered, report key available.
+    if (_ibm_pending) return true;
+    // Non-interactive (piped) input: no extra bytes to report.
     if (!isatty(STDIN_FILENO)) return false;
     _enable_raw_mode();
     struct timeval tv = {0, 0};
@@ -1590,15 +1595,9 @@ static bool _pas_keypressed() {
     return select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0;
 }
 
-// Arrow key codes we return as single chars (above ASCII range mapped to safe values)
-// We use chars that won't collide with normal printable keys:
-// Up='\x01', Down='\x02', Left='\x03', Right='\x04'
-#define KEY_UP    '\x01'
-#define KEY_DOWN  '\x02'
-#define KEY_LEFT  '\x03'
-#define KEY_RIGHT '\x04'
-
 static char _pas_readkey() {
+    // Return buffered IBM extended-key second byte if one is pending.
+    if (_ibm_pending) { char c = _ibm_pending; _ibm_pending = 0; return c; }
     _enable_raw_mode();
     char ch = 0;
     while (true) {
@@ -1609,18 +1608,20 @@ static char _pas_readkey() {
         if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
             if (read(STDIN_FILENO, &ch, 1) != 1) continue;
             if (ch == 27) {
-                // Possible escape sequence — check for [ with short timeout
+                // Possible ANSI escape sequence — check for [ with short timeout
                 struct timeval tv2 = {0, 10000};
                 fd_set fds2; FD_ZERO(&fds2); FD_SET(STDIN_FILENO, &fds2);
                 if (select(STDIN_FILENO + 1, &fds2, nullptr, nullptr, &tv2) > 0) {
                     char seq[2] = {0, 0};
                     if (read(STDIN_FILENO, &seq[0], 1) == 1 && seq[0] == '[') {
                         if (read(STDIN_FILENO, &seq[1], 1) == 1) {
+                            // Map ANSI arrow to IBM-PC extended key: return \x00 now,
+                            // buffer the IBM code for the next Read(Kbd,Ch) call.
                             switch (seq[1]) {
-                                case 'A': return KEY_UP;
-                                case 'B': return KEY_DOWN;
-                                case 'C': return KEY_RIGHT;
-                                case 'D': return KEY_LEFT;
+                                case 'A': _ibm_pending = 'H'; return '\x00'; // up
+                                case 'B': _ibm_pending = 'P'; return '\x00'; // down
+                                case 'C': _ibm_pending = 'M'; return '\x00'; // right
+                                case 'D': _ibm_pending = 'K'; return '\x00'; // left
                             }
                         }
                     }
@@ -2549,7 +2550,16 @@ class Interpreter {
                 if (auto* vn = dynamic_cast<VarNode*>(arg_nodes[i].get())) {
                     std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
                     std::string plo = pd->params[i].name; std::transform(plo.begin(),plo.end(),plo.begin(),::tolower);
-                    env->set(lo, call_env->get(plo));
+                    Value wval = call_env->get(plo);
+                    // Coerce CHAR -> STRING when the target variable is STRING-typed
+                    if (wval.vtype == Value::Type::CHAR) {
+                        try {
+                            Value& cur = env->get_ref(lo);
+                            if (cur.vtype == Value::Type::STRING)
+                                wval = Value::from_string(std::string(1, wval.cval));
+                        } catch (...) {}
+                    }
+                    env->set(lo, wval);
                 }
             }
         }
@@ -2665,9 +2675,23 @@ class Interpreter {
                 }
                 if (rec->vtype != Value::Type::RECORD || !rec->fields)
                     throw std::runtime_error("Not a record");
+                // Coerce CHAR -> STRING when the existing field is a STRING
+                if (val.vtype == Value::Type::CHAR) {
+                    auto fit = rec->fields->find(path.back());
+                    if (fit != rec->fields->end() && fit->second.vtype == Value::Type::STRING)
+                        val = Value::from_string(std::string(1, val.cval));
+                }
                 (*rec->fields)[path.back()] = val;
             } else if (auto* vn = dynamic_cast<VarNode*>(n->target.get())) {
                 std::string lo = vn->name; std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
+                // Coerce CHAR -> STRING when the declared target type is string-like
+                if (val.vtype == Value::Type::CHAR) {
+                    try {
+                        Value& cur = env->get_ref(lo);
+                        if (cur.vtype == Value::Type::STRING)
+                            val = Value::from_string(std::string(1, val.cval));
+                    } catch (...) {}
+                }
                 env->set(lo, val);
             }
             return;

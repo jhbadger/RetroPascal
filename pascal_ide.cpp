@@ -680,31 +680,39 @@ TPascalIDE::TPascalIDE()
 
 TMenuBar* TPascalIDE::initMenuBar(TRect r) {
     r.b.y = r.a.y + 1;
-    return new TMenuBar(r,
+    return new TMenuBar(
+        r,
         *new TSubMenu("~F~ile", kbAltF) +
-            *new TMenuItem("~N~ew",           cmNewFile,    kbNoKey,    hcNoContext, "F2")        +
-            *new TMenuItem("~O~pen...",       cmOpenFile,   kbF3,       hcNoContext, "F3")        +
-            *new TMenuItem("~S~ave",          cmSaveFile,   kbF2,       hcNoContext, "F2")        +
-            *new TMenuItem("Save ~A~s...",    cmSaveFileAs, kbNoKey)                              +
-            newLine()                                                                              +
-            *new TMenuItem("E~x~it",          cmQuit,       kbAltX,     hcNoContext, "Alt-X")     +
-        *new TSubMenu("~E~dit", kbAltE) +
-            *new TMenuItem("~U~ndo",          cmUndo,       kbAltBack,  hcNoContext, "Alt-BkSp")  +
-            newLine()                                                                              +
-            *new TMenuItem("~C~ut",           cmCut,        kbShiftDel, hcNoContext, "Shift-Del") +
-            *new TMenuItem("C~o~py",          cmCopy,       kbCtrlIns,  hcNoContext, "Ctrl-Ins")  +
-            *new TMenuItem("~P~aste",         cmPaste,      kbShiftIns, hcNoContext, "Shift-Ins") +
-            newLine()                                                                              +
-            *new TMenuItem("~G~o to Line...", cmGotoLine,   kbNoKey)                              +
-        *new TSubMenu("~R~un", kbAltR) +
-            *new TMenuItem("~R~un",             cmRunProgram, kbF9,  hcNoContext, "F9")           +
-            *new TMenuItem("~C~ompile && Run",  cmCompileRun, kbF8,  hcNoContext, "F8")           +
-        *new TSubMenu("~S~earch", kbAltS) +
-            *new TMenuItem("~F~ind...",        cmFind,        kbCtrlF,    hcNoContext, "Ctrl-F") +
-            *new TMenuItem("~R~eplace...",     cmReplace,     kbCtrlH,    hcNoContext, "Ctrl-H") +
-            *new TMenuItem("~A~gain",          cmSearchAgain, kbF7,       hcNoContext, "F7")     +
-        *new TSubMenu("~W~indow", kbAltW) +
-            *new TMenuItem("~L~ist...",        cmWindowList,  kbNoKey)                           +
+            *new TMenuItem("~N~ew", cmNewFile, kbNoKey, hcNoContext, "F2") +
+            *new TMenuItem("~O~pen...", cmOpenFile, kbF3, hcNoContext, "F3") +
+            *new TMenuItem("~S~ave", cmSaveFile, kbF2, hcNoContext, "F2") +
+            *new TMenuItem("Save ~A~s...", cmSaveFileAs, kbNoKey) + newLine() +
+            *new TMenuItem("E~x~it", cmQuit, kbAltX, hcNoContext, "Alt-X") +
+            *new TSubMenu("~E~dit", kbAltE) +
+            *new TMenuItem("~U~ndo", cmUndo, kbAltBack, hcNoContext,
+                           "Alt-BkSp") +
+            newLine() +
+            *new TMenuItem("~C~ut", cmCut, kbShiftDel, hcNoContext,
+                           "Shift-Del") +
+            *new TMenuItem("C~o~py", cmCopy, kbCtrlIns, hcNoContext,
+                           "Ctrl-Ins") +
+            *new TMenuItem("~P~aste", cmPaste, kbShiftIns, hcNoContext,
+                           "Shift-Ins") +
+            newLine() + *new TMenuItem("~G~o to Line...", cmGotoLine, kbNoKey) +
+            *new TSubMenu("~R~un", kbAltR) +
+            *new TMenuItem("~R~un", cmRunProgram, kbF9, hcNoContext, "F9") +
+            *new TMenuItem("~C~ompile && Run", cmCompileRun, kbF8, hcNoContext,
+                           "F8") +
+            *new TSubMenu("~S~earch", kbAltS) +
+            *new TMenuItem("~F~ind...", cmFind, kbCtrlF, hcNoContext,
+                           "Ctrl-F") +
+            *new TMenuItem("~R~eplace...", cmReplace, kbCtrlH, hcNoContext,
+                           "Ctrl-H") +
+            *new TMenuItem("~A~gain", cmSearchAgain, kbF7, hcNoContext, "F7") +
+*new TSubMenu("~W~indow", kbAltW) +
+            
+            *new TMenuItem("Switch Window",      cmWindow1 + 1, kbAlt2, hcNoContext, "Alt-2") +
+            
         *new TSubMenu("~H~elp", kbAltH) +
             *new TMenuItem("~A~bout...",      cmAbout,      kbNoKey)
     );
@@ -743,7 +751,12 @@ std::vector<TEditorWindow*> TPascalIDE::getEditorWindows() {
 }
 
 void TPascalIDE::handleEvent(TEvent& event) {
-    if (event.what == evCommand) {
+  if (event.what == evCommand) {
+if (event.message.command >= cmWindow1 && event.message.command < cmWindow1 + 40) {
+            selectWindow(event.message.command - cmWindow1);
+            clearEvent(event);
+            return;
+        }    
         switch (event.message.command) {
             case cmNewFile:    newFile();        clearEvent(event); return;
             case cmOpenFile:   openFile();       clearEvent(event); return;
